@@ -1,0 +1,7 @@
+# Скрипты Windows должны иметь окончания CRLF, иначе cmd может разбирать их некорректно
+*.bat text eol=crlf
+*.cmd text eol=crlf
+# Исходники Python и документация — LF
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf

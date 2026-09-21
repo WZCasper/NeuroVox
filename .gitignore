@@ -1,0 +1,35 @@
+# Скачиваемые модели (сотни мегабайт, скачиваются при первом запуске)
+models/
+*.pt
+*.pth
+*.part
+
+# Логи и пользовательские настройки
+logs/
+settings.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Виртуальные окружения
+venv/
+.venv/
+env/
+
+# Сборка
+build/
+dist/
+*.spec
+
+# Редакторы и ОС
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Секреты — никогда не коммитим
+.env
+*.token
