@@ -32,10 +32,31 @@ def _base_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def _data_dir() -> Path:
+    """
+    Папка для пользовательских данных: модели, журналы, настройки.
+
+    * Переменная окружения NEUROVOX_HOME имеет приоритет (нужна для тестов).
+    * В собранной программе (.exe) данные лежат в %LOCALAPPDATA%\\NeuroVox: туда
+      можно писать без прав администратора, где бы ни лежала сама программа.
+    * При запуске из исходников — рядом с кодом.
+    """
+    override = os.environ.get("NEUROVOX_HOME")
+    if override:
+        return Path(override).expanduser()
+    if getattr(sys, "frozen", False):
+        if sys.platform == "win32":
+            root = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+            return Path(root) / APP_NAME
+        return Path.home() / f".{APP_NAME.lower()}"
+    return _base_dir()
+
+
 BASE_DIR: Path = _base_dir()
-MODELS_DIR: Path = BASE_DIR / "models"
-LOGS_DIR: Path = BASE_DIR / "logs"
-SETTINGS_FILE: Path = BASE_DIR / "settings.json"
+DATA_DIR: Path = _data_dir()
+MODELS_DIR: Path = DATA_DIR / "models"
+LOGS_DIR: Path = DATA_DIR / "logs"
+SETTINGS_FILE: Path = DATA_DIR / "settings.json"
 
 # ---------------------------------------------------------------------------
 # Модели Silero TTS
@@ -114,9 +135,11 @@ class Settings:
 
     # -- сохранение / загрузка -------------------------------------------------
 
-    def save(self, path: Path = SETTINGS_FILE) -> None:
+    def save(self, path: Optional[Path] = None) -> None:
         """Сохраняет настройки в JSON. Ошибки записи не должны ронять приложение."""
+        path = path or SETTINGS_FILE
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(
                 json.dumps(asdict(self), ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -125,8 +148,9 @@ class Settings:
             logger.warning("Не удалось сохранить настройки: %s", exc)
 
     @classmethod
-    def load(cls, path: Path = SETTINGS_FILE) -> "Settings":
+    def load(cls, path: Optional[Path] = None) -> "Settings":
         """Загружает настройки. При любой ошибке возвращает значения по умолчанию."""
+        path = path or SETTINGS_FILE
         settings = cls()
         if not path.exists():
             return settings

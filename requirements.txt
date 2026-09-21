@@ -6,6 +6,9 @@
 #
 # ВАЖНО: у видеокарт AMD нет CUDA, поэтому всё считается на процессоре.
 # Обычный «pip install torch» под Windows ставит именно CPU-сборку — то, что нужно.
+# (Сборка .exe в GitHub Actions ставит torch с https://download.pytorch.org/whl/cpu.)
+#
+# Для сборки .exe дополнительно нужны:  pip install pyinstaller pyinstaller-hooks-contrib
 
 # --- Интерфейс ---
 customtkinter>=5.2.0

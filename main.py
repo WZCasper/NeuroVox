@@ -2,15 +2,32 @@
 """
 NeuroVox — офлайн-озвучка игровых субтитров (Windows).
 
-Запуск:  python main.py
+Запуск:            python main.py    (или NeuroVox.exe)
+Самопроверка:      NeuroVox.exe --selftest [--strict] [--models] [--out отчёт.txt]
 """
 
+import argparse
 import logging
+import multiprocessing
+import os
 import sys
 import threading
 import traceback
+from typing import List, Optional
 
 import config
+
+
+def _ensure_std_streams() -> None:
+    """
+    Подставляет «пустые» sys.stdout/sys.stderr, если консоли нет.
+
+    В собранной программе без консоли (.exe) эти потоки равны None, и любая
+    библиотека, которая пишет в них (индикаторы загрузки, print), упала бы с ошибкой.
+    """
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name, None) is None:
+            setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
 
 
 def _enable_dpi_awareness() -> None:
@@ -34,7 +51,7 @@ def _enable_dpi_awareness() -> None:
 
 
 def _show_fatal_error(details: str) -> None:
-    """Показывает окно с фатальной ошибкой (консоль может закрыться мгновенно)."""
+    """Показывает окно с фатальной ошибкой (консоли в .exe нет, и ошибку иначе не увидеть)."""
     try:
         import tkinter as tk
         from tkinter import messagebox
@@ -44,7 +61,7 @@ def _show_fatal_error(details: str) -> None:
         messagebox.showerror(
             "NeuroVox — критическая ошибка",
             "Программа неожиданно завершила работу.\n\n"
-            f"{details}\n\nПодробности сохранены в папке logs.",
+            f"{details}\n\nПодробности сохранены в журнале:\n{config.LOGS_DIR}",
         )
         root.destroy()
     except Exception:  # noqa: BLE001
@@ -68,13 +85,31 @@ def _install_exception_hooks() -> None:
     threading.excepthook = handle_thread
 
 
-def main() -> int:
+def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog=config.APP_NAME,
+        description="Озвучка игровых субтитров в реальном времени (офлайн).",
+    )
+    parser.add_argument("--selftest", action="store_true", help="проверить, что все компоненты работают, и выйти")
+    parser.add_argument("--strict", action="store_true", help="самопроверка: отсутствие любой библиотеки считать ошибкой")
+    parser.add_argument("--models", action="store_true", help="самопроверка: скачать и проверить модели озвучки и OCR")
+    parser.add_argument("--out", default=None, help="самопроверка: сохранить отчёт в этот файл")
+    # Неизвестные аргументы игнорируем, чтобы запуск из ярлыков и «Открыть с помощью» не ломался.
+    args, _unknown = parser.parse_known_args(argv)
+    return args
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    _ensure_std_streams()
+
     # Кодировка вывода: русские сообщения не должны ломаться в консоли Windows.
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError):
             pass
+
+    args = _parse_args(argv)
 
     config.setup_logging()
     _install_exception_hooks()
@@ -88,6 +123,11 @@ def main() -> int:
         return 1
 
     _enable_dpi_awareness()
+
+    if args.selftest:
+        import selftest
+
+        return selftest.run(strict=args.strict, models=args.models, out_path=args.out)
 
     try:
         from gui import MainWindow
@@ -112,4 +152,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()  # нужно для собранной программы (PyInstaller)
     sys.exit(main())

@@ -7,6 +7,7 @@
 AMD нет CUDA, поэтому GPU не используется.
 """
 
+import inspect
 import logging
 import os
 import re
@@ -32,6 +33,22 @@ _SENTENCE_SPLIT = re.compile(r"(?<=[.!?…])\s+")
 
 # Допустимые символы для Silero (кириллица, латиница, цифры, базовая пунктуация).
 _ALLOWED = re.compile(r"[^А-Яа-яЁёA-Za-z0-9\s.,!?:;\-–—…'\"()+]")
+
+
+# Необязательные параметры apply_tts: ударения и буква «ё». У разных версий модели
+# Silero набор параметров может отличаться, поэтому передаём только поддерживаемые.
+_OPTIONAL_TTS_KWARGS = ("put_accent", "put_yo")
+
+
+def detect_optional_kwargs(model) -> tuple:
+    """Определяет, какие из необязательных параметров умеет принимать model.apply_tts."""
+    try:
+        params = inspect.signature(model.apply_tts).parameters
+    except (AttributeError, TypeError, ValueError):
+        return _OPTIONAL_TTS_KWARGS
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return _OPTIONAL_TTS_KWARGS
+    return tuple(name for name in _OPTIONAL_TTS_KWARGS if name in params)
 
 
 class TtsError(Exception):
@@ -190,6 +207,7 @@ class SileroTts:
         self.sample_rate = config.TTS_SAMPLE_RATE
         self._model = None
         self._torch = None
+        self._optional_kwargs: tuple = _OPTIONAL_TTS_KWARGS
 
     @property
     def is_loaded(self) -> bool:
@@ -202,6 +220,7 @@ class SileroTts:
 
         try:
             import torch  # noqa: WPS433 — ленивый импорт намеренный
+            from torch import package as torch_package
         except ImportError as exc:
             raise TtsError(
                 "Библиотека PyTorch не установлена. Выполните: pip install torch"
@@ -215,7 +234,7 @@ class SileroTts:
         torch.set_num_threads(max(2, min(4, cpu_count // 2)))
 
         try:
-            importer = torch.package.PackageImporter(str(path))
+            importer = torch_package.PackageImporter(str(path))
             model = importer.load_pickle("tts_models", "model")
             model.to(torch.device("cpu"))
         except Exception as exc:  # noqa: BLE001
@@ -230,6 +249,7 @@ class SileroTts:
             ) from exc
 
         self._model = model
+        self._optional_kwargs = detect_optional_kwargs(model)
         logger.info("Модель озвучки %s загружена (CPU).", self.model_name)
 
     def available_speakers(self) -> List[str]:
@@ -242,6 +262,21 @@ class SileroTts:
             )
         except AttributeError:
             return list(config.SILERO_SPEAKERS)
+
+    def _apply_tts(self, chunk: str, speaker: str):
+        """Вызывает model.apply_tts; если модель не знает необязательных параметров — повторяет без них."""
+        base = {"text": chunk, "speaker": speaker, "sample_rate": self.sample_rate}
+        extra = {name: True for name in self._optional_kwargs}
+        try:
+            return self._model.apply_tts(**base, **extra)
+        except TypeError:
+            if not extra:
+                raise
+            logger.warning(
+                "Модель не поддерживает параметры %s — синтез выполняется без них.", ", ".join(extra)
+            )
+            self._optional_kwargs = ()
+            return self._model.apply_tts(**base)
 
     def synthesize(self, text: str, speaker: str, speed: float = 1.0) -> List[np.ndarray]:
         """
@@ -262,13 +297,7 @@ class SileroTts:
         for chunk in split_into_chunks(prepared):
             try:
                 with self._torch.inference_mode():
-                    audio = self._model.apply_tts(
-                        text=chunk,
-                        speaker=speaker,
-                        sample_rate=self.sample_rate,
-                        put_accent=True,
-                        put_yo=True,
-                    )
+                    audio = self._apply_tts(chunk, speaker)
             except Exception as exc:  # noqa: BLE001
                 raise TtsError(f"Ошибка синтеза речи: {exc}") from exc
 

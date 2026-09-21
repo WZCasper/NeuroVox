@@ -1,0 +1,144 @@
+name: Сборка Windows-версии
+
+# Когда запускается:
+#   * при создании тега вида v1.0.0  -> сборка, проверка и ПУБЛИКАЦИЯ релиза;
+#   * вручную (вкладка Actions)      -> сборка и проверка, готовые файлы лежат в «Artifacts».
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # нужно, чтобы создать релиз и приложить к нему файлы
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: NeuroVox для Windows
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PYTHONUTF8: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      # Данные проверок (скачанные модели) лежат вне сборки и в неё не попадают.
+      NEUROVOX_HOME: ${{ github.workspace }}\ci-data
+
+    steps:
+      - name: Получение кода
+        uses: actions/checkout@v4
+
+      - name: Установка Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Установка PyTorch (только CPU)
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m pip install --upgrade pip
+          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Установка зависимостей и PyInstaller
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m pip install -r requirements.txt pyinstaller pyinstaller-hooks-contrib
+          python -m pip list
+
+      - name: Модульные тесты
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m unittest discover -s tests -t . -v
+
+      - name: Сборка программы (PyInstaller)
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          pyinstaller --noconfirm --clean NeuroVox.spec
+          $size = (Get-ChildItem dist\NeuroVox -Recurse -File | Measure-Object Length -Sum).Sum / 1MB
+          "Размер папки dist\NeuroVox: {0:N0} МБ" -f $size
+
+      - name: Быстрая проверка собранной программы
+        timeout-minutes: 10
+        run: |
+          $exe = Join-Path $PWD "dist\NeuroVox\NeuroVox.exe"
+          $out = Join-Path $PWD "selftest-fast.txt"
+          $p = Start-Process -FilePath $exe -ArgumentList @("--selftest", "--strict", "--out", $out) -PassThru
+          $null = $p.Handle   # без этого PowerShell может не запомнить код завершения
+          $finished = $p.WaitForExit(480000)
+          if (-not $finished) { $p.Kill() }
+          if (Test-Path $out) { Get-Content $out -Encoding UTF8 }
+          if (-not $finished) { throw "Быстрая проверка не завершилась за 8 минут" }
+          if ($p.ExitCode -ne 0) { throw "Быстрая проверка не пройдена (код $($p.ExitCode))" }
+
+      - name: Проверка моделей (скачивание Silero и EasyOCR, синтез речи, распознавание)
+        timeout-minutes: 40
+        run: |
+          $exe = Join-Path $PWD "dist\NeuroVox\NeuroVox.exe"
+          $out = Join-Path $PWD "selftest-models.txt"
+          $p = Start-Process -FilePath $exe -ArgumentList @("--selftest", "--strict", "--models", "--out", $out) -PassThru
+          $null = $p.Handle
+          $finished = $p.WaitForExit(2100000)
+          if (-not $finished) { $p.Kill() }
+          if (Test-Path $out) { Get-Content $out -Encoding UTF8 }
+          if (-not $finished) { throw "Проверка моделей не завершилась за 35 минут" }
+          if ($p.ExitCode -ne 0) { throw "Проверка моделей не пройдена (код $($p.ExitCode))" }
+
+      - name: Упаковка в zip (портативная версия)
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          7z a -tzip -mx=5 NeuroVox-windows-x64.zip .\dist\NeuroVox
+          "Размер архива: {0:N0} МБ" -f ((Get-Item NeuroVox-windows-x64.zip).Length / 1MB)
+
+      # Установщик — дополнительный удобный вариант. Если он не соберётся, релиз всё равно
+      # будет создан с zip-архивом.
+      - name: Создание установщика (Inno Setup)
+        continue-on-error: true
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe не найден после установки Inno Setup" }
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          if ($version -notmatch '^\d+(\.\d+)*$') { $version = "0.0.0" }
+          & $iscc "/DAppVersion=$version" installer\NeuroVox.iss
+          "Размер установщика: {0:N0} МБ" -f ((Get-Item dist-installer\NeuroVox-Setup.exe).Length / 1MB)
+
+      - name: Сохранение отчётов проверок
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selftest-reports
+          path: selftest-*.txt
+          if-no-files-found: ignore
+
+      - name: Сохранение сборки (ручной запуск)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: NeuroVox-windows-x64
+          path: |
+            NeuroVox-windows-x64.zip
+            dist-installer/NeuroVox-Setup.exe
+          compression-level: 0
+          if-no-files-found: warn
+
+      - name: Публикация релиза
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $assets = @("NeuroVox-windows-x64.zip")
+          if (Test-Path "dist-installer\NeuroVox-Setup.exe") {
+            $assets = @("dist-installer\NeuroVox-Setup.exe") + $assets
+          }
+          gh release create $env:GITHUB_REF_NAME @assets --title "NeuroVox $env:GITHUB_REF_NAME" --notes-file .github\release-notes.md

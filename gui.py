@@ -7,6 +7,9 @@
 """
 
 import logging
+import os
+import subprocess
+import sys
 import time
 import tkinter as tk
 from tkinter import messagebox
@@ -193,9 +196,13 @@ class MainWindow(ctk.CTk):
             row=0, column=0, sticky="w"
         )
         ctk.CTkButton(
+            log_header, text="Папка журнала", width=110, height=26, fg_color="#3a4358", hover_color="#2d3547",
+            command=self._open_logs_folder,
+        ).grid(row=0, column=1, padx=(0, 6), sticky="e")
+        ctk.CTkButton(
             log_header, text="Очистить", width=80, height=26, fg_color="#3a4358", hover_color="#2d3547",
             command=self._clear_log,
-        ).grid(row=0, column=1, sticky="e")
+        ).grid(row=0, column=2, sticky="e")
 
         self.log_box = ctk.CTkTextbox(log_frame, wrap="word", font=ctk.CTkFont(size=13))
         self.log_box.grid(row=1, column=0, padx=12, pady=(6, 12), sticky="nsew")
@@ -351,6 +358,17 @@ class MainWindow(ctk.CTk):
             self.log_box.delete("1.0", f"{lines - MAX_LOG_LINES}.0")
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
+
+    def _open_logs_folder(self) -> None:
+        """Открывает папку с файлом журнала (удобно, чтобы прислать его при ошибке)."""
+        try:
+            config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
+            if sys.platform == "win32":
+                os.startfile(str(config.LOGS_DIR))  # noqa: S606 — открываем свою папку
+            else:
+                subprocess.Popen(["xdg-open", str(config.LOGS_DIR)])
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"⚠ Не удалось открыть папку журнала ({config.LOGS_DIR}): {exc}")
 
     def _clear_log(self) -> None:
         self.log_box.configure(state="normal")

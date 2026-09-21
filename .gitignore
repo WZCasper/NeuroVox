@@ -22,7 +22,7 @@ env/
 # Сборка
 build/
 dist/
-*.spec
+dist-installer/
 
 # Редакторы и ОС
 .vscode/
@@ -33,3 +33,8 @@ Thumbs.db
 # Секреты — никогда не коммитим
 .env
 *.token
+
+# Данные и отчёты проверок
+ci-data/
+selftest-*.txt
+*.zip
