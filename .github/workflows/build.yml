@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: write   # нужно, чтобы создать релиз и приложить к нему файлы
+  issues: write     # нужно, чтобы при сбое самопроверки опубликовать отчёт в Issue (см. ниже)
 
 concurrency:
   group: windows-build-${{ github.ref }}
@@ -105,6 +106,52 @@ jobs:
           name: selftest-reports
           path: selftest-*.txt
           if-no-files-found: ignore
+
+      # Логи и артефакты Actions отдаются с productionresultssa*.blob.core.windows.net,
+      # который недоступен из некоторых сетевых окружений. Чтобы отчёт самопроверки
+      # можно было прочитать и оттуда, при сбое он дополнительно публикуется в Issue —
+      # обычный объект репозитория, читаемый через api.github.com.
+      - name: Публикация отчёта в Issue при сбое
+        if: failure()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $title = "Сборка не пройдена: $($env:GITHUB_REF_NAME) (запуск #$($env:GITHUB_RUN_NUMBER))"
+          $body = New-Object System.Text.StringBuilder
+          [void]$body.AppendLine("Автоматический отчёт о неудачной сборке.")
+          [void]$body.AppendLine("")
+          [void]$body.AppendLine("Коммит: $($env:GITHUB_SHA)")
+          [void]$body.AppendLine("Запуск: $($env:GITHUB_SERVER_URL)/$($env:GITHUB_REPOSITORY)/actions/runs/$($env:GITHUB_RUN_ID)")
+          foreach ($name in @("selftest-fast", "selftest-models")) {
+              $txt = "${name}.txt"
+              $out = "${name}.stdout.log"
+              $err = "${name}.stderr.log"
+              if (Test-Path $txt) {
+                  [void]$body.AppendLine("")
+                  [void]$body.AppendLine("## Отчёт: $name")
+                  [void]$body.AppendLine('```')
+                  [void]$body.AppendLine((Get-Content $txt -Encoding UTF8 -Raw))
+                  [void]$body.AppendLine('```')
+              }
+              foreach ($pair in @(@{Label = "stdout"; Path = $out}, @{Label = "stderr"; Path = $err})) {
+                  if ((Test-Path $pair.Path) -and (Get-Item $pair.Path).Length -gt 0) {
+                      [void]$body.AppendLine("")
+                      [void]$body.AppendLine("## $name — $($pair.Label)")
+                      [void]$body.AppendLine('```')
+                      [void]$body.AppendLine((Get-Content $pair.Path -Encoding UTF8 -Raw))
+                      [void]$body.AppendLine('```')
+                  }
+              }
+          }
+          $bodyText = $body.ToString()
+          if ($bodyText.Length -gt 60000) {
+              $bodyText = $bodyText.Substring(0, 60000) + "`n`n... (отчёт обрезан, полный текст — в артефакте selftest-reports)"
+          }
+          $bodyFile = New-TemporaryFile
+          Set-Content -Path $bodyFile -Value $bodyText -Encoding UTF8
+          gh issue create --title $title --body-file $bodyFile
 
       - name: Сохранение сборки (ручной запуск)
         if: github.event_name == 'workflow_dispatch'
