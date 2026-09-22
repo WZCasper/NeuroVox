@@ -66,29 +66,15 @@ jobs:
 
       - name: Быстрая проверка собранной программы
         timeout-minutes: 10
+        shell: pwsh
         run: |
-          $exe = Join-Path $PWD "dist\NeuroVox\NeuroVox.exe"
-          $out = Join-Path $PWD "selftest-fast.txt"
-          $p = Start-Process -FilePath $exe -ArgumentList @("--selftest", "--strict", "--out", $out) -PassThru
-          $null = $p.Handle   # без этого PowerShell может не запомнить код завершения
-          $finished = $p.WaitForExit(480000)
-          if (-not $finished) { $p.Kill() }
-          if (Test-Path $out) { Get-Content $out -Encoding UTF8 }
-          if (-not $finished) { throw "Быстрая проверка не завершилась за 8 минут" }
-          if ($p.ExitCode -ne 0) { throw "Быстрая проверка не пройдена (код $($p.ExitCode))" }
+          . .\.github\scripts\Invoke-Selftest.ps1 -ReportName "selftest-fast" -ExtraArgs @() -TimeoutMs 480000
 
       - name: Проверка моделей (скачивание Silero и EasyOCR, синтез речи, распознавание)
         timeout-minutes: 40
+        shell: pwsh
         run: |
-          $exe = Join-Path $PWD "dist\NeuroVox\NeuroVox.exe"
-          $out = Join-Path $PWD "selftest-models.txt"
-          $p = Start-Process -FilePath $exe -ArgumentList @("--selftest", "--strict", "--models", "--out", $out) -PassThru
-          $null = $p.Handle
-          $finished = $p.WaitForExit(2100000)
-          if (-not $finished) { $p.Kill() }
-          if (Test-Path $out) { Get-Content $out -Encoding UTF8 }
-          if (-not $finished) { throw "Проверка моделей не завершилась за 35 минут" }
-          if ($p.ExitCode -ne 0) { throw "Проверка моделей не пройдена (код $($p.ExitCode))" }
+          . .\.github\scripts\Invoke-Selftest.ps1 -ReportName "selftest-models" -ExtraArgs @("--models") -TimeoutMs 2100000
 
       - name: Упаковка в zip (портативная версия)
         run: |
