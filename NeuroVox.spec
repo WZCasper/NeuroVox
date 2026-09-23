@@ -11,6 +11,7 @@
 """
 
 import importlib.util
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all, copy_metadata
@@ -79,18 +80,29 @@ for distribution in (
         pass
 
 # Модели Silero — это архивы torch.package: внутри лежит собственный Python-код модели,
-# который при загрузке импортирует стандартные модули. PyInstaller не видит внутрь .pt,
-# поэтому перечисляем стандартные модули явно, иначе модель могла бы не загрузиться.
-STDLIB_FOR_MODELS = [
-    "abc", "array", "ast", "base64", "binascii", "bisect", "cmath", "codecs", "collections",
-    "collections.abc", "contextlib", "copy", "copyreg", "csv", "dataclasses", "datetime",
-    "decimal", "difflib", "dis", "enum", "fractions", "functools", "glob", "hashlib", "heapq",
-    "importlib", "importlib.abc", "importlib.machinery", "importlib.util", "inspect", "io",
-    "itertools", "json", "locale", "logging", "math", "numbers", "operator", "os", "pathlib",
-    "pickle", "pickletools", "platform", "queue", "random", "re", "shutil", "statistics",
-    "string", "struct", "tempfile", "textwrap", "threading", "time", "tokenize", "traceback",
-    "types", "typing", "unicodedata", "warnings", "weakref", "zipfile", "zlib",
-]
+# который при загрузке импортирует произвольные модули стандартной библиотеки — заранее
+# неизвестно, какие именно (это чужой, сторонний код, а не наш). PyInstaller не видит
+# внутрь файла модели (.pt), чтобы определить это статически, поэтому ручной перечень
+# оказался неполным на практике: не хватило модуля wave (используется где-то в torch/
+# внутри пикла модели), и следующим мог не хватить любой другой модуль. Вместо того
+# чтобы гадать и дописывать по одному, включаем ВСЮ стандартную библиотеку текущей
+# версии Python — это её официальный полный список (sys.stdlib_module_names, Python
+# >= 3.10), а не наша ручная догадка. Несколько лишних мегабайт в сборке — приемлемая
+# цена за то, что модель Silero гарантированно не упадёт на недостающем импорте.
+# Исключены: приватные модули ("_..."), пасхалки (antigravity, this), инструменты
+# разработки, которых нет и не должно быть в готовой программе (idlelib, lib2to3,
+# turtledemo, pydoc_data, test), и модули других ОС (winsound и другие есть в списке
+# CPython независимо от платформы сборки; PyInstaller лишь выводит по ним безобидное
+# предупреждение "not found" на других ОС, но раз мы собираем именно под Windows,
+# специфичные для неё модули оставляем — они настоящие и нужные).
+_STDLIB_SKIP = {
+    "antigravity", "this", "__main__",
+    "idlelib", "lib2to3", "turtledemo", "pydoc_data", "test", "ensurepip",
+}
+STDLIB_FOR_MODELS = sorted(
+    name for name in sys.stdlib_module_names
+    if not name.startswith("_") and name not in _STDLIB_SKIP
+)
 
 hiddenimports += STDLIB_FOR_MODELS
 if _available("torch"):
