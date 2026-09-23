@@ -41,17 +41,22 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.txt
 
-      - name: Установка PyTorch (только CPU)
+      - name: Установка зависимостей (torch — только CPU) и PyInstaller
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           python -m pip install --upgrade pip
-          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-
-      - name: Установка зависимостей и PyInstaller
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $true
-          python -m pip install -r requirements.txt pyinstaller pyinstaller-hooks-contrib
+          # torch и torchvision ставятся ОДНОЙ командой с CPU-индексом PyTorch как основным
+          # источником (--index-url), а обычный PyPI подключён как дополнительный
+          # (--extra-index-url) — для остальных пакетов из requirements.txt. Это важно:
+          # если поставить torch/torchvision отдельной командой, а остальные зависимости
+          # (easyocr тянет torchvision>=0.5) — второй командой без CPU-индекса, pip может
+          # переустановить torchvision с обычного PyPI. У обычной и CPU-сборки одинаковый
+          # номер версии, но разные бинарные расширения (ABI), и тогда получается ошибка
+          # "operator torchvision::nms does not exist". Одна команда с общим списком
+          # источников исключает эту рассинхронизацию.
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple -r requirements.txt pyinstaller pyinstaller-hooks-contrib
           python -m pip list
+          python -c "import torch, torchvision; print('torch', torch.__version__, '| torchvision', torchvision.__version__); from torchvision.ops import nms; print('torchvision::nms доступен')"
 
       - name: Модульные тесты
         run: |
