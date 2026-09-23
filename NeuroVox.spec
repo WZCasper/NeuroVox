@@ -32,6 +32,15 @@ datas, binaries, hiddenimports = [], [], []
 # Пакеты с данными или динамически подгружаемыми модулями: берём их целиком.
 #   customtkinter — темы и шрифты интерфейса
 #   rapidfuzz     — C-модули выбираются в момент запуска
+#   torchvision   — операторы (torchvision.ops.nms и другие) регистрируются через C++-
+#                   расширение torchvision._C, которое подгружается динамически. Штатный
+#                   хук PyInstaller добавляет только hiddenimports=['torchvision._C'], но
+#                   этого недостаточно: сам .pyd/.so файл может не попасть в binaries, и
+#                   тогда при запуске падает "RuntimeError: operator torchvision::nms does
+#                   not exist" — оператор виден в Python-обёртке, а его C++-реализация не
+#                   загрузилась. collect_all забирает все бинарные файлы пакета явно.
+#                   (torch трогать не нужно: для него есть исчерпывающий штатный хук
+#                   pyinstaller-hooks-contrib с collect_dynamic_libs и сбором DLL MKL.)
 #   easyocr       — списки символов и словари распознавания
 #   skimage       — «ленивая» загрузка подмодулей (нужна EasyOCR)
 #   shapely, pyclipper, yaml, bidi — зависимости EasyOCR с бинарными модулями
@@ -39,6 +48,7 @@ datas, binaries, hiddenimports = [], [], []
 for package in (
     "customtkinter",
     "rapidfuzz",
+    "torchvision",
     "easyocr",
     "skimage",
     "shapely",
