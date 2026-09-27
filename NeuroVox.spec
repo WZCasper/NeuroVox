@@ -108,8 +108,8 @@ hiddenimports += STDLIB_FOR_MODELS
 if _available("torch"):
     hiddenimports.append("torch.package")
 hiddenimports += [
-    "config", "capture", "ocr_engine", "text_filter", "tts_engine", "workers",
-    "overlay", "gui", "selftest",
+    "config", "capture", "frame_buffer", "ocr_engine", "pronunciation", "text_filter",
+    "tts_engine", "workers", "overlay", "gui", "selftest",
 ]
 
 # Заведомо ненужное: уменьшает размер и ускоряет сборку.

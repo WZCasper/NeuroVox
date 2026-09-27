@@ -75,5 +75,40 @@ class SubtitleFilterTests(unittest.TestCase):
         self.assertEqual(self._spoken(frames), ["Беги отсюда"])
 
 
+class SettledFrameTests(unittest.TestCase):
+    """Кадры, которые уже признаны устоявшимися по картинке, повторно подтверждать не нужно."""
+
+    def test_settled_text_is_spoken_immediately(self):
+        flt = SubtitleFilter(threshold=85, stable_frames=2)
+        self.assertEqual(flt.process("Куда ты пропал?", settled=True), "Куда ты пропал?")
+
+    def test_settled_repeat_is_not_spoken_twice(self):
+        flt = SubtitleFilter(threshold=85, stable_frames=2)
+        self.assertIsNotNone(flt.process("Куда ты пропал?", settled=True))
+        self.assertIsNone(flt.process("Куда ты пропал?", settled=True))
+
+    def test_different_settled_phrases_are_all_spoken(self):
+        flt = SubtitleFilter(threshold=85, stable_frames=2)
+        spoken = [flt.process(text, settled=True) for text in ("Первая реплика", "Вторая реплика героя", "Третья реплика")]
+        self.assertEqual([s for s in spoken if s], ["Первая реплика", "Вторая реплика героя", "Третья реплика"])
+
+    def test_unsettled_text_still_needs_confirmation(self):
+        flt = SubtitleFilter(threshold=85, stable_frames=2)
+        self.assertIsNone(flt.process("Куда ты пропал?", settled=False))
+        self.assertEqual(flt.process("Куда ты пропал?", settled=False), "Куда ты пропал?")
+
+    def test_settled_noise_or_junk_is_still_dropped(self):
+        flt = SubtitleFilter(threshold=85, stable_frames=2)
+        self.assertIsNone(flt.process("12:45", settled=True))
+        self.assertIsNone(flt.process("", settled=True))
+
+    def test_forget_allows_the_same_phrase_again(self):
+        flt = SubtitleFilter(threshold=85, stable_frames=2)
+        self.assertIsNotNone(flt.process("Беги отсюда", settled=True))
+        self.assertIsNone(flt.process("Беги отсюда", settled=True))
+        flt.forget()
+        self.assertEqual(flt.process("Беги отсюда", settled=True), "Беги отсюда")
+
+
 if __name__ == "__main__":
     unittest.main()

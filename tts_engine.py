@@ -20,6 +20,7 @@ from typing import Callable, List, Optional
 import numpy as np
 
 import config
+from pronunciation import StressDictionary, normalize_caps
 
 logger = logging.getLogger("neurovox.tts")
 
@@ -35,9 +36,17 @@ _SENTENCE_SPLIT = re.compile(r"(?<=[.!?…])\s+")
 _ALLOWED = re.compile(r"[^А-Яа-яЁёA-Za-z0-9\s.,!?:;\-–—…'\"()+]")
 
 
-# Необязательные параметры apply_tts: ударения и буква «ё». У разных версий модели
-# Silero набор параметров может отличаться, поэтому передаём только поддерживаемые.
-_OPTIONAL_TTS_KWARGS = ("put_accent", "put_yo")
+# Необязательные параметры apply_tts (из официального примера Silero для моделей v5):
+#   put_accent       — автоматически ставить ударения;
+#   put_yo           — восстанавливать букву «ё»;
+#   put_stress_homo  — выбирать ударение у омографов по смыслу (замОк / зАмок);
+#   put_yo_homo      — то же для «ё» у омографов (все / всё).
+# У разных версий модели набор параметров отличается (в v4_ru омографов нет), поэтому
+# передаём только те, которые модель действительно принимает.
+_OPTIONAL_TTS_KWARGS = ("put_accent", "put_yo", "put_stress_homo", "put_yo_homo")
+
+# Python сообщает имя лишнего параметра в тексте ошибки: unexpected keyword argument 'имя'.
+_UNEXPECTED_KWARG = re.compile(r"unexpected keyword argument '(\w+)'")
 
 
 def detect_optional_kwargs(model) -> tuple:
@@ -208,6 +217,7 @@ class SileroTts:
         self._model = None
         self._torch = None
         self._optional_kwargs: tuple = _OPTIONAL_TTS_KWARGS
+        self._dictionary = StressDictionary()
 
     @property
     def is_loaded(self) -> bool:
@@ -264,19 +274,31 @@ class SileroTts:
             return list(config.SILERO_SPEAKERS)
 
     def _apply_tts(self, chunk: str, speaker: str):
-        """Вызывает model.apply_tts; если модель не знает необязательных параметров — повторяет без них."""
+        """
+        Вызывает model.apply_tts с необязательными параметрами.
+
+        Если модель не принимает какой-то параметр, отказываемся именно от него, а не
+        от всех сразу: например, v4_ru не знает про омографы, но ударения ставит.
+        """
         base = {"text": chunk, "speaker": speaker, "sample_rate": self.sample_rate}
         extra = {name: True for name in self._optional_kwargs}
-        try:
-            return self._model.apply_tts(**base, **extra)
-        except TypeError:
-            if not extra:
-                raise
-            logger.warning(
-                "Модель не поддерживает параметры %s — синтез выполняется без них.", ", ".join(extra)
-            )
-            self._optional_kwargs = ()
-            return self._model.apply_tts(**base)
+        while True:
+            try:
+                return self._model.apply_tts(**base, **extra)
+            except TypeError as exc:
+                if not extra:
+                    raise
+                match = _UNEXPECTED_KWARG.search(str(exc))
+                rejected = match.group(1) if match else None
+                if rejected in extra:
+                    del extra[rejected]
+                    logger.info("Модель не принимает параметр %s — синтез выполняется без него.", rejected)
+                else:
+                    logger.warning(
+                        "Модель не приняла параметры %s — синтез выполняется без них.", ", ".join(extra)
+                    )
+                    extra = {}
+                self._optional_kwargs = tuple(extra)
 
     def synthesize(self, text: str, speaker: str, speed: float = 1.0) -> List[np.ndarray]:
         """
@@ -289,6 +311,8 @@ class SileroTts:
         prepared = prepare_text(text)
         if not prepared:
             return []
+        # Фразы капсом приводим к обычному виду, затем применяем словарь ударений пользователя.
+        prepared = self._dictionary.apply(normalize_caps(prepared))
 
         if speaker not in self.available_speakers():
             speaker = config.DEFAULT_SPEAKER

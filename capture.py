@@ -7,11 +7,14 @@ ScreenCapture нужно создавать и использовать внут
 """
 
 import logging
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import cv2
 import mss
 import numpy as np
+
+import config
 
 logger = logging.getLogger("neurovox.capture")
 
@@ -120,3 +123,116 @@ def frames_are_similar(a: Optional[np.ndarray], b: Optional[np.ndarray], toleran
         return False
     diff = cv2.absdiff(a, b)
     return float(diff.mean()) < tolerance
+
+
+# ---------------------------------------------------------------------------
+# Слежение за изменениями картинки в области
+# ---------------------------------------------------------------------------
+
+# Допуск на погрешность сравнения времени с плавающей точкой (например, 1.20 - 0.40
+# в IEEE 754 равно 0.7999999999999999, а не ровно 0.8). Пороги отсчёта времени в этом
+# классе — секунды, поэтому доля миллисекунды не меняет поведение по сути, но избавляет
+# от «залипания» на границе интервала.
+_TIME_EPSILON = 1e-6
+
+
+@dataclass(frozen=True)
+class Commit:
+    """Решение трекера: этот снимок нужно отправить на распознавание."""
+
+    image: Optional[np.ndarray]   # None — метка «область опустела»
+    settled: bool                 # True — картинка устоялась; False — отправлена принудительно
+
+
+class AreaTracker:
+    """
+    Следит за картинкой ОДНОЙ области и решает, когда её снимок пора распознавать.
+
+    Зачем это нужно. Распознавать каждый кадр слишком долго, а распознавать «как
+    получится» — значит пропускать реплики. Трекер работает на скорости снимков
+    (десятки раз в секунду) и по картинке, без распознавания, определяет три вещи:
+
+      1. Картинка изменилась и НЕ менялась ``settle_time`` секунд — субтитр показан
+         целиком (не «печатается», не проявляется). Снимок отправляется на
+         распознавание с пометкой settled=True, и подтверждать его повторно не нужно.
+      2. Картинка меняется постоянно (анимированный фон, очень медленная печать) —
+         тогда раз в ``max_wait`` секунд отправляется самый свежий снимок с пометкой
+         settled=False, а фильтр текста сам решит, устоялся ли текст.
+      3. Область была пустой ``empty_hold`` секунд после субтитра — отправляется метка
+         «область опустела»: реплика закончилась, и та же фраза потом будет озвучена снова.
+
+    Класс не знает ни про экран, ни про потоки: время передаётся параметром, поэтому
+    его можно проверять обычными тестами.
+    """
+
+    def __init__(
+        self,
+        settle_time: float = config.CAPTURE_SETTLE_SECONDS,
+        max_wait: float = config.CAPTURE_MAX_WAIT_SECONDS,
+        empty_hold: float = config.CAPTURE_EMPTY_HOLD_SECONDS,
+        tolerance: float = 1.5,
+    ) -> None:
+        self._settle_time = settle_time
+        self._max_wait = max_wait
+        self._empty_hold = empty_hold
+        self._tolerance = tolerance
+
+        self._committed: Optional[np.ndarray] = None   # что уже отправлено на распознавание
+        self._pending: Optional[np.ndarray] = None     # новая картинка, ждущая «успокоения»
+        self._first_diff_at: Optional[float] = None    # когда картинка впервые отличилась от отправленной
+        self._last_change_at: float = 0.0              # когда картинка менялась в последний раз
+        self._empty_since: Optional[float] = None
+        self._empty_reported = False
+
+    def update(self, image: Optional[np.ndarray], now: float) -> Optional[Commit]:
+        """
+        Сообщает трекеру очередной подготовленный кадр (None — в кадре нет текста).
+
+        Возвращает Commit, если снимок нужно отправить на распознавание, иначе None.
+        """
+        if image is None:
+            return self._on_empty(now)
+
+        self._empty_since = None
+        self._empty_reported = False
+
+        # Картинка такая же, как уже отправленная, — ничего нового.
+        if self._committed is not None and frames_are_similar(image, self._committed, self._tolerance):
+            self._pending = None
+            self._first_diff_at = None
+            return None
+
+        if self._first_diff_at is None:
+            self._first_diff_at = now
+        # Сравниваем с «опорным» кадром, а не с предыдущим: медленное плавное
+        # изменение не должно выглядеть как «ничего не меняется».
+        if self._pending is None or not frames_are_similar(image, self._pending, self._tolerance):
+            self._pending = image
+            self._last_change_at = now
+
+        settled = (now - self._last_change_at) >= self._settle_time - _TIME_EPSILON
+        forced = (now - self._first_diff_at) >= self._max_wait - _TIME_EPSILON
+        if not (settled or forced):
+            return None
+
+        commit = Commit(image=self._pending, settled=settled)
+        self._committed = self._pending
+        self._pending = None
+        self._first_diff_at = None
+        return commit
+
+    def _on_empty(self, now: float) -> Optional[Commit]:
+        self._pending = None
+        self._first_diff_at = None
+        if self._empty_since is None:
+            self._empty_since = now
+        if (
+            self._committed is not None
+            and not self._empty_reported
+            and (now - self._empty_since) >= self._empty_hold - _TIME_EPSILON
+        ):
+            self._committed = None
+            self._empty_reported = True
+            return Commit(image=None, settled=True)
+        return None
+

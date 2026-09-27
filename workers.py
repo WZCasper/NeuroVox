@@ -4,7 +4,17 @@
 
 Архитектура (главный поток занят только интерфейсом):
 
-    [Поток захвата и OCR] --текст--> [Фильтр] --фраза--> [Очередь] --> [Поток озвучки и воспроизведения]
+    [Поток снимков] --снимки--> [Буфер] --по очереди--> [Поток распознавания]
+                                                              |
+                                                            фразы
+                                                              v
+                                     [Очередь] --> [Поток озвучки и воспроизведения]
+
+Снимки экрана делаются быстро (десятки раз в секунду) и не ждут медленного
+распознавания: устоявшиеся снимки копятся в буфере, а распознавание разбирает их
+строго по очереди. Поэтому ни одна реплика не теряется, даже если субтитр сменился,
+пока читался предыдущий. Реплики из нескольких областей озвучиваются по одной, с паузой
+между областями.
 
 Потоки общаются через thread-safe очереди и события. Любые сообщения для
 интерфейса отправляются в очередь событий, а GUI сам забирает их в своём
@@ -17,12 +27,13 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 
 import config
-from capture import CaptureError, ScreenCapture, frames_are_similar, preprocess_for_ocr
+from capture import AreaTracker, CaptureError, ScreenCapture, preprocess_for_ocr
+from frame_buffer import FrameBuffer
 from ocr_engine import BaseOcr, OcrError, create_with_fallback
 from text_filter import SubtitleFilter
 from tts_engine import SileroTts, TtsError
@@ -163,105 +174,43 @@ class SharedSettings:
 
 
 # ---------------------------------------------------------------------------
-# Поток захвата и распознавания
+# Реплика в очереди озвучки
 # ---------------------------------------------------------------------------
 
-class CaptureOcrWorker(threading.Thread):
-    """Циклически захватывает область экрана, распознаёт текст и фильтрует его."""
+@dataclass
+class SpeechItem:
+    """Распознанная реплика, ожидающая озвучки."""
 
-    def __init__(
-        self,
-        shared: SharedSettings,
-        bus: EventBus,
-        speech_queue: "queue.Queue[str]",
-        stop_event: threading.Event,
-        ocr: BaseOcr,
-    ) -> None:
-        super().__init__(name="CaptureOcrWorker", daemon=True)
-        self._shared = shared
-        self._bus = bus
-        self._speech_queue = speech_queue
-        self._stop_event = stop_event
-        self._ocr = ocr
+    area: int           # номер области, из которой взята реплика (0, 1, 2 ...)
+    text: str
+    created_at: float   # time.monotonic() в момент распознавания
 
-    def run(self) -> None:
-        # mss нужно создавать именно в том потоке, где он используется.
+
+def put_dropping_oldest(speech_queue: "queue.Queue[SpeechItem]", item: SpeechItem) -> None:
+    """Кладёт реплику в очередь; при переполнении выбрасывает самую старую."""
+    while True:
         try:
-            capture = ScreenCapture()
-        except CaptureError as exc:
-            self._bus.emit("error", str(exc))
+            speech_queue.put_nowait(item)
             return
-
-        settings = self._shared.snapshot()
-        subtitle_filter = SubtitleFilter(threshold=settings.similarity_threshold)
-        previous_image: Optional[np.ndarray] = None
-        last_raw_text = ""
-        consecutive_errors = 0
-
-        self._bus.emit("status", "Слежение за субтитрами запущено.")
-        logger.info("Поток захвата и OCR запущен.")
-
-        try:
-            while not self._stop_event.is_set():
-                cycle_start = time.perf_counter()
-                settings = self._shared.snapshot()
-                subtitle_filter.threshold = settings.similarity_threshold
-
-                try:
-                    frame = capture.grab(tuple(settings.roi))
-                    image = preprocess_for_ocr(frame)
-
-                    if image is None:
-                        raw_text = ""
-                    elif frames_are_similar(image, previous_image):
-                        # Картинка не изменилась — повторный OCR не нужен.
-                        raw_text = last_raw_text
-                    else:
-                        raw_text = self._ocr.recognize(image)
-                    previous_image = image
-                    last_raw_text = raw_text
-                    consecutive_errors = 0
-                except CaptureError as exc:
-                    consecutive_errors += 1
-                    self._report_repeated_error(consecutive_errors, str(exc))
-                    self._sleep_until(cycle_start, 1.0)
-                    continue
-                except OcrError as exc:
-                    consecutive_errors += 1
-                    self._report_repeated_error(consecutive_errors, str(exc))
-                    self._sleep_until(cycle_start, 1.0)
-                    continue
-                except Exception as exc:  # noqa: BLE001 — поток не должен падать из-за одного кадра
-                    consecutive_errors += 1
-                    logger.exception("Непредвиденная ошибка в цикле захвата")
-                    self._report_repeated_error(consecutive_errors, f"Непредвиденная ошибка: {exc}")
-                    self._sleep_until(cycle_start, 1.0)
-                    continue
-
-                phrase = subtitle_filter.process(raw_text)
-                if phrase:
-                    self._bus.emit("recognized", phrase)
-                    self._enqueue_phrase(phrase)
-
-                self._sleep_until(cycle_start, 1.0 / max(settings.capture_fps, 0.5))
-        finally:
-            capture.close()
-            logger.info("Поток захвата и OCR остановлен.")
-
-    # -- вспомогательные методы -------------------------------------------------
-
-    def _enqueue_phrase(self, phrase: str) -> None:
-        """Кладёт фразу в очередь; при переполнении выбрасывает самую старую."""
-        while True:
+        except queue.Full:
             try:
-                self._speech_queue.put_nowait(phrase)
-                return
-            except queue.Full:
-                try:
-                    dropped = self._speech_queue.get_nowait()
-                    logger.info("Очередь озвучки переполнена, пропущена фраза: %s", dropped)
-                except queue.Empty:
-                    pass
+                dropped = speech_queue.get_nowait()
+                logger.info("Очередь озвучки переполнена, пропущена фраза: %s", dropped.text)
+            except queue.Empty:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Общая основа циклических потоков
+# ---------------------------------------------------------------------------
+
+class _LoopWorker(threading.Thread):
+    """Основа рабочего потока: остановка по событию и учёт повторяющихся ошибок."""
+
+    def __init__(self, name: str, bus: EventBus, stop_event: threading.Event) -> None:
+        super().__init__(name=name, daemon=True)
+        self._bus = bus
+        self._stop_event = stop_event
 
     def _report_repeated_error(self, count: int, message: str) -> None:
         """Сообщает об ошибке в интерфейс, но не чаще чем раз в несколько попыток."""
@@ -278,17 +227,197 @@ class CaptureOcrWorker(threading.Thread):
 
 
 # ---------------------------------------------------------------------------
-# Поток озвучки
+# Поток снимков экрана
 # ---------------------------------------------------------------------------
 
-class TtsPlaybackWorker(threading.Thread):
-    """Берёт фразы из очереди, синтезирует речь и сразу воспроизводит."""
+class CaptureWorker(_LoopWorker):
+    """
+    Быстро снимает все области экрана и складывает устоявшиеся снимки в буфер.
+
+    Здесь нет распознавания текста, поэтому цикл укладывается в единицы миллисекунд
+    на область и снимки идут с частотой ``capture_fps`` (по умолчанию 15 раз в секунду),
+    что бы в это время ни делало распознавание.
+    """
 
     def __init__(
         self,
         shared: SharedSettings,
         bus: EventBus,
-        speech_queue: "queue.Queue[str]",
+        buffer: FrameBuffer,
+        stop_event: threading.Event,
+        capture_factory: Callable[[], ScreenCapture] = ScreenCapture,
+    ) -> None:
+        super().__init__("CaptureWorker", bus, stop_event)
+        self._shared = shared
+        self._buffer = buffer
+        self._capture_factory = capture_factory
+
+    def run(self) -> None:
+        # mss нужно создавать именно в том потоке, где он используется.
+        try:
+            capture = self._capture_factory()
+        except CaptureError as exc:
+            self._bus.emit("error", str(exc))
+            return
+
+        trackers: List[AreaTracker] = []
+        consecutive_errors = 0
+
+        self._bus.emit("status", "Слежение за субтитрами запущено.")
+        logger.info("Поток снимков запущен.")
+
+        try:
+            while not self._stop_event.is_set():
+                cycle_start = time.perf_counter()
+                settings = self._shared.snapshot()
+                rois = settings.rois
+                if len(trackers) != len(rois):
+                    # Число областей изменилось — начинаем слежение за каждой заново.
+                    trackers = [AreaTracker() for _ in rois]
+                    logger.info("Областей субтитров: %d", len(rois))
+
+                failure: Optional[str] = None
+                now = time.monotonic()
+                for index, roi in enumerate(rois):
+                    try:
+                        image = preprocess_for_ocr(capture.grab(tuple(roi)))
+                    except CaptureError as exc:
+                        failure = str(exc)
+                        continue
+                    except Exception as exc:  # noqa: BLE001 — поток не должен падать из-за одного кадра
+                        logger.exception("Непредвиденная ошибка в цикле снимков")
+                        failure = f"Непредвиденная ошибка: {exc}"
+                        continue
+
+                    commit = trackers[index].update(image, now)
+                    if commit is not None:
+                        self._buffer.put(index, commit.image, settled=commit.settled, captured_at=now)
+
+                if failure is not None:
+                    consecutive_errors += 1
+                    self._report_repeated_error(consecutive_errors, failure)
+                    self._sleep_until(cycle_start, 1.0)
+                    continue
+
+                consecutive_errors = 0
+                self._sleep_until(cycle_start, 1.0 / max(settings.capture_fps, config.MIN_CAPTURE_FPS))
+        finally:
+            capture.close()
+            logger.info("Поток снимков остановлен.")
+
+
+# ---------------------------------------------------------------------------
+# Поток распознавания
+# ---------------------------------------------------------------------------
+
+class OcrWorker(_LoopWorker):
+    """
+    Берёт снимки из буфера по очереди, распознаёт текст и отправляет реплики на озвучку.
+
+    Пока идёт распознавание одного снимка, поток снимков продолжает работать, а
+    новые устоявшиеся снимки ждут своей очереди в буфере — ничего не пропадает.
+    Для каждой области ведётся свой фильтр повторов.
+    """
+
+    def __init__(
+        self,
+        shared: SharedSettings,
+        bus: EventBus,
+        buffer: FrameBuffer,
+        speech_queue: "queue.Queue[SpeechItem]",
+        stop_event: threading.Event,
+        ocr: BaseOcr,
+    ) -> None:
+        super().__init__("OcrWorker", bus, stop_event)
+        self._shared = shared
+        self._buffer = buffer
+        self._speech_queue = speech_queue
+        self._ocr = ocr
+
+    def run(self) -> None:
+        filters: Dict[int, SubtitleFilter] = {}
+        area_count = 0
+        consecutive_errors = 0
+        last_purge = time.monotonic()
+        logger.info("Поток распознавания запущен.")
+
+        try:
+            while not self._stop_event.is_set():
+                frame = self._buffer.take_next(timeout=0.2)
+
+                # Прочитанные снимки удаляем через FRAME_RETENTION_SECONDS, устаревшие — тоже.
+                now = time.monotonic()
+                if now - last_purge >= 1.0:
+                    self._buffer.purge()
+                    last_purge = now
+                if frame is None:
+                    continue
+
+                settings = self._shared.snapshot()
+                if len(settings.rois) != area_count:
+                    # Области добавили или убрали: нумерация могла сдвинуться — фильтры начинаем заново.
+                    filters.clear()
+                    area_count = len(settings.rois)
+                if frame.area >= area_count:
+                    continue  # область уже удалена
+
+                subtitle_filter = filters.get(frame.area)
+                if subtitle_filter is None:
+                    subtitle_filter = filters[frame.area] = SubtitleFilter(
+                        threshold=settings.similarity_threshold
+                    )
+                subtitle_filter.threshold = settings.similarity_threshold
+
+                if frame.is_marker:
+                    # Область опустела: реплика закончилась, такая же фраза позже — уже новая.
+                    subtitle_filter.forget()
+                    continue
+
+                try:
+                    raw_text = self._ocr.recognize(frame.image)
+                    consecutive_errors = 0
+                except OcrError as exc:
+                    consecutive_errors += 1
+                    self._report_repeated_error(consecutive_errors, str(exc))
+                    self._stop_event.wait(0.5)
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    consecutive_errors += 1
+                    logger.exception("Непредвиденная ошибка распознавания")
+                    self._report_repeated_error(consecutive_errors, f"Непредвиденная ошибка: {exc}")
+                    self._stop_event.wait(0.5)
+                    continue
+
+                phrase = subtitle_filter.process(raw_text, settled=frame.settled)
+                if phrase:
+                    label = f"[{frame.area + 1}] " if area_count > 1 else ""
+                    self._bus.emit("recognized", f"{label}{phrase}")
+                    put_dropping_oldest(
+                        self._speech_queue, SpeechItem(frame.area, phrase, time.monotonic())
+                    )
+        finally:
+            logger.info("Поток распознавания остановлен.")
+
+
+# ---------------------------------------------------------------------------
+# Поток озвучки
+# ---------------------------------------------------------------------------
+
+class TtsPlaybackWorker(threading.Thread):
+    """
+    Берёт реплики из очереди по одной, синтезирует речь и воспроизводит.
+
+    Реплики читаются строго по очереди — две не звучат одновременно. Между репликами
+    из разных областей выдерживается пауза ``area_pause``, между репликами одной
+    области — короткая пауза. Пока играет одна реплика, следующая ждёт в очереди; её
+    синтез идёт до паузы, чтобы пауза не растягивалась на время синтеза.
+    """
+
+    def __init__(
+        self,
+        shared: SharedSettings,
+        bus: EventBus,
+        speech_queue: "queue.Queue[SpeechItem]",
         stop_event: threading.Event,
         tts: SileroTts,
         player: AudioPlayer,
@@ -300,48 +429,51 @@ class TtsPlaybackWorker(threading.Thread):
         self._stop_event = stop_event
         self._tts = tts
         self._player = player
+        self._last_area: Optional[int] = None
+        self._last_finished: float = 0.0
 
     def run(self) -> None:
         logger.info("Поток озвучки запущен.")
         try:
             while not self._stop_event.is_set():
                 try:
-                    phrase = self._speech_queue.get(timeout=0.2)
+                    item = self._speech_queue.get(timeout=0.2)
                 except queue.Empty:
                     continue
 
-                # Если за время синтеза накопились новые реплики, старые уже неактуальны.
-                phrase = self._skip_to_latest(phrase)
-                self._speak(phrase)
+                # Реплика, простоявшая в очереди слишком долго, в игре уже неактуальна.
+                if time.monotonic() - item.created_at > config.MAX_PHRASE_AGE_SECONDS:
+                    logger.info("Реплика устарела и пропущена: %s", item.text)
+                    continue
+                self._speak(item)
         finally:
             self._player.stop()
             logger.info("Поток озвучки остановлен.")
 
-    def _skip_to_latest(self, phrase: str) -> str:
-        """Пропускает устаревшие фразы, чтобы озвучка не отставала от экрана."""
-        skipped = 0
-        while self._speech_queue.qsize() > config.MAX_TTS_QUEUE - 1:
-            try:
-                phrase = self._speech_queue.get_nowait()
-                skipped += 1
-            except queue.Empty:
-                break
-        if skipped:
-            logger.info("Пропущено устаревших реплик: %d", skipped)
-        return phrase
+    def _wait_turn(self, area: int, area_pause: float) -> None:
+        """Выдерживает паузу после предыдущей реплики (дольше — при смене области)."""
+        if self._last_area is None:
+            return
+        gap = area_pause if area != self._last_area else config.SAME_AREA_GAP_SECONDS
+        remaining = gap - (time.monotonic() - self._last_finished)
+        if remaining > 0:
+            self._stop_event.wait(remaining)
 
-    def _speak(self, phrase: str) -> None:
+    def _speak(self, item: SpeechItem) -> None:
         settings = self._shared.snapshot()
         try:
             started = time.perf_counter()
-            fragments = self._tts.synthesize(phrase, settings.speaker, settings.speed)
+            fragments = self._tts.synthesize(item.text, settings.speaker, settings.speed)
             if not fragments:
                 return
-            self._bus.emit("spoken", phrase, time.perf_counter() - started)
+            self._bus.emit("spoken", item.text, time.perf_counter() - started)
+            self._wait_turn(item.area, settings.area_pause)
             for fragment in fragments:
                 if self._stop_event.is_set():
                     return
                 self._player.play(fragment, settings.volume)
+            self._last_area = item.area
+            self._last_finished = time.monotonic()
         except TtsError as exc:
             logger.error("Ошибка озвучки: %s", exc)
             self._bus.emit("error", str(exc))
@@ -366,7 +498,8 @@ class NeuroVoxEngine:
         self._shared = shared
         self._bus = bus
         self._stop_event = threading.Event()
-        self._speech_queue: "queue.Queue[str]" = queue.Queue(maxsize=config.MAX_TTS_QUEUE)
+        self._speech_queue: "queue.Queue[SpeechItem]" = queue.Queue(maxsize=config.MAX_TTS_QUEUE)
+        self._buffer = FrameBuffer()
         self._threads = []
         self._starter: Optional[threading.Thread] = None
         self._ocr: Optional[BaseOcr] = None
@@ -417,13 +550,15 @@ class NeuroVoxEngine:
             return
 
         self._speech_queue = queue.Queue(maxsize=config.MAX_TTS_QUEUE)
-        capture_thread = CaptureOcrWorker(
-            self._shared, self._bus, self._speech_queue, self._stop_event, self._ocr
+        self._buffer = FrameBuffer()
+        capture_thread = CaptureWorker(self._shared, self._bus, self._buffer, self._stop_event)
+        ocr_thread = OcrWorker(
+            self._shared, self._bus, self._buffer, self._speech_queue, self._stop_event, self._ocr
         )
         tts_thread = TtsPlaybackWorker(
             self._shared, self._bus, self._speech_queue, self._stop_event, self._tts, self._player
         )
-        self._threads = [capture_thread, tts_thread]
+        self._threads = [capture_thread, ocr_thread, tts_thread]
         for thread in self._threads:
             thread.start()
         self._bus.emit("ready", "Готово. Программа следит за субтитрами.")
@@ -461,6 +596,7 @@ class NeuroVoxEngine:
             if thread.is_alive() and thread is not threading.current_thread():
                 thread.join(timeout=3.0)
         self._threads = []
+        self._buffer.clear()   # снимки прошлого сеанса при следующем запуске не нужны
         with self._lock:
             self._running = False
         self._bus.emit("stopped", "Остановлено.")

@@ -4,6 +4,7 @@
 
 Пользователь перетаскивает окно поверх субтитров игры и растягивает его
 за правый нижний угол. Координаты окна на экране и есть область захвата.
+Областей может быть несколько: у каждой свой номер и свой цвет рамки.
 
 Особенность реализации: окно делается полупрозрачным (-alpha), а не
 «сквозным» (-transparentcolor). Сквозное окно не ловит клики мыши, и его
@@ -21,7 +22,9 @@ logger = logging.getLogger("neurovox.overlay")
 MIN_WIDTH = 80
 MIN_HEIGHT = 30
 GRIP_SIZE = 22           # размер «уголка» для изменения размера
-BORDER_COLOR = "#00d4ff"
+# Цвета рамок по номерам областей (первая — голубая, как раньше).
+AREA_COLORS = ("#00d4ff", "#ffb020", "#7cfc00", "#ff5ca8", "#b18cff", "#ff7a45")
+BORDER_COLOR = AREA_COLORS[0]
 FILL_COLOR = "#0b1d2a"
 IDLE_ALPHA = 0.30        # прозрачность, пока пользователь ничего не делает
 ACTIVE_ALPHA = 0.55      # прозрачность во время перетаскивания
@@ -35,20 +38,25 @@ class SelectionOverlay(ctk.CTkToplevel):
         master,
         roi: Tuple[int, int, int, int],
         on_change: Optional[Callable[[Tuple[int, int, int, int]], None]] = None,
+        index: int = 0,
     ) -> None:
         super().__init__(master)
         self._on_change = on_change
+        self._index = index
         self._drag_offset: Tuple[int, int] = (0, 0)
         self._resize_origin: Tuple[int, int, int, int] = (0, 0, 0, 0)
         self._mode: str = ""
 
         left, top, width, height = roi
+        self._last_roi: Tuple[int, int, int, int] = (
+            int(left), int(top), max(int(width), MIN_WIDTH), max(int(height), MIN_HEIGHT)
+        )
         self.overrideredirect(True)                 # без рамки и заголовка
         self.attributes("-topmost", True)           # поверх всех окон (в т.ч. игры в оконном режиме)
         self._set_alpha(IDLE_ALPHA)
         self.configure(fg_color=FILL_COLOR)
         self.geometry(f"{max(width, MIN_WIDTH)}x{max(height, MIN_HEIGHT)}+{left}+{top}")
-        self.title("NeuroVox — область захвата")
+        self.title(f"NeuroVox — область захвата {index + 1}")
 
         # Внешняя рамка (canvas рисует контур, который хорошо виден на любом фоне).
         self._canvas = tk.Canvas(self, bg=FILL_COLOR, highlightthickness=0, bd=0, cursor="fleur")
@@ -67,14 +75,39 @@ class SelectionOverlay(ctk.CTkToplevel):
 
     # -- публичные методы -----------------------------------------------------
 
+    @property
+    def index(self) -> int:
+        """Номер области (с нуля)."""
+        return self._index
+
+    def set_index(self, index: int) -> None:
+        """Меняет номер области (после удаления соседней) и перерисовывает рамку."""
+        self._index = index
+        self.title(f"NeuroVox — область захвата {index + 1}")
+        self._redraw()
+
+    @property
+    def color(self) -> str:
+        return AREA_COLORS[self._index % len(AREA_COLORS)]
+
     def get_roi(self) -> Tuple[int, int, int, int]:
-        """Текущая область захвата на экране: (left, top, width, height)."""
+        """
+        Текущая область захвата на экране: (left, top, width, height).
+
+        У скрытой рамки (и у рамки, которую скрыли до первого показа) размеры окна,
+        которые сообщает Tk, недостоверны (1×1), поэтому для неё возвращается
+        последняя известная область.
+        """
         self.update_idletasks()
-        return (self.winfo_x(), self.winfo_y(), self.winfo_width(), self.winfo_height())
+        if self.winfo_viewable() and self.winfo_width() > 1 and self.winfo_height() > 1:
+            self._last_roi = (self.winfo_x(), self.winfo_y(), self.winfo_width(), self.winfo_height())
+        return self._last_roi
 
     def set_roi(self, roi: Tuple[int, int, int, int]) -> None:
         left, top, width, height = roi
-        self.geometry(f"{max(width, MIN_WIDTH)}x{max(height, MIN_HEIGHT)}+{left}+{top}")
+        width, height = max(width, MIN_WIDTH), max(height, MIN_HEIGHT)
+        self._last_roi = (int(left), int(top), int(width), int(height))
+        self.geometry(f"{width}x{height}+{left}+{top}")
         self._notify()
 
     def show(self) -> None:
@@ -104,18 +137,23 @@ class SelectionOverlay(ctk.CTkToplevel):
         if width < 4 or height < 4:
             return
 
-        canvas.create_rectangle(1, 1, width - 2, height - 2, outline=BORDER_COLOR, width=3)
+        color = self.color
+        canvas.create_rectangle(1, 1, width - 2, height - 2, outline=color, width=3)
         canvas.create_text(
             width // 2, height // 2,
-            text="Область субтитров\nперетащите  •  тяните за угол",
+            text=f"Область субтитров {self._index + 1}\nперетащите  •  тяните за угол",
             fill="#e8faff", font=("Segoe UI", 10), justify="center",
+        )
+        # Номер области в левом верхнем углу — виден, даже если рамка узкая.
+        canvas.create_text(
+            10, 8, text=str(self._index + 1), anchor="nw", fill=color, font=("Segoe UI", 14, "bold"),
         )
         # Уголок изменения размера в правом нижнем углу.
         canvas.create_polygon(
             width - GRIP_SIZE, height - 2,
             width - 2, height - 2,
             width - 2, height - GRIP_SIZE,
-            fill=BORDER_COLOR, outline="",
+            fill=color, outline="",
         )
 
     # -- мышь -----------------------------------------------------------------

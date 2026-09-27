@@ -22,7 +22,7 @@ logger = logging.getLogger("neurovox.config")
 # ---------------------------------------------------------------------------
 
 APP_NAME = "NeuroVox"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 
 def _base_dir() -> Path:
@@ -57,19 +57,26 @@ DATA_DIR: Path = _data_dir()
 MODELS_DIR: Path = DATA_DIR / "models"
 LOGS_DIR: Path = DATA_DIR / "logs"
 SETTINGS_FILE: Path = DATA_DIR / "settings.json"
+# Словарь ударений и произношений: пользователь дописывает туда слова, которые озвучка
+# произносит неверно (имена героев, игровые термины). Читается при каждой фразе.
+STRESS_DICT_FILE: Path = DATA_DIR / "stress_dict.txt"
 
 # ---------------------------------------------------------------------------
 # Модели Silero TTS
 # ---------------------------------------------------------------------------
 
 # Прямые ссылки на официальные модели Silero (см. models.yml в snakers4/silero-models).
+#
+# v5_5_ru — актуальная русская модель: автоматические ударения, разбор омографов
+# (замОк / зАмок) и вопросительная интонация. В v4_ru омографов нет, а редкие слова
+# и имена она ставит хуже — поэтому по умолчанию используется v5_5_ru, а v4_ru
+# оставлена как запасной вариант.
 SILERO_MODELS = {
+    "v5_5_ru": "https://models.silero.ai/models/tts/ru/v5_5_ru.pt",
     "v4_ru": "https://models.silero.ai/models/tts/ru/v4_ru.pt",
-    "v5_ru": "https://models.silero.ai/models/tts/ru/v5_ru.pt",
 }
 
-# Модель по умолчанию: v4_ru — самая обкатанная.
-DEFAULT_TTS_MODEL = "v4_ru"
+DEFAULT_TTS_MODEL = "v5_5_ru"
 
 # Голоса модели v4_ru и v5_ru (из официальной документации Silero).
 # Ключ — имя в модели, значение — отображаемое имя в интерфейсе.
@@ -102,8 +109,34 @@ SIMILARITY_THRESHOLD = 85
 # Минимальная длина осмысленной реплики (в символах) после очистки.
 MIN_TEXT_LENGTH = 3
 
-# Сколько раз в секунду захватывать экран.
-DEFAULT_CAPTURE_FPS = 3.5
+# Сколько раз в секунду делать снимки экрана. Снимок стоит единицы миллисекунд, а
+# распознавание — сотни, поэтому они разнесены по разным потокам: снимки идут быстро
+# и копятся в буфере, а распознавание разбирает буфер по очереди.
+DEFAULT_CAPTURE_FPS = 15.0
+MIN_CAPTURE_FPS = 2.0
+MAX_CAPTURE_FPS = 30.0
+
+# Сколько секунд картинка в области должна оставаться неизменной, чтобы считать, что
+# субтитр показан целиком (не «печатается» и не появляется плавно).
+CAPTURE_SETTLE_SECONDS = 0.30
+
+# Если картинка не успокаивается (анимированный фон, очень медленная печать), снимок
+# всё равно отправляется на распознавание не реже, чем раз в столько секунд.
+CAPTURE_MAX_WAIT_SECONDS = 1.5
+
+# Сколько секунд область должна быть пустой, чтобы считать реплику законченной.
+CAPTURE_EMPTY_HOLD_SECONDS = 0.8
+
+# Буфер снимков: прочитанные снимки удаляются через FRAME_RETENTION_SECONDS, непрочитанные
+# (если распознавание не справляется) — через FRAME_MAX_UNREAD_AGE_SECONDS: реплика
+# полуминутной давности в игре уже неактуальна.
+FRAME_RETENTION_SECONDS = 10.0
+FRAME_MAX_UNREAD_AGE_SECONDS = 30.0
+FRAME_BUFFER_MAX_FRAMES = 48
+
+# Несколько областей субтитров.
+MAX_AREAS = 6
+DEFAULT_ROI = (400, 800, 1100, 120)
 
 # Сколько кадров подряд текст должен оставаться неизменным, прежде чем его
 # считать «устоявшимся». Защищает от озвучивания недопечатанных строк.
@@ -113,14 +146,26 @@ STABLE_FRAMES_REQUIRED = 2
 # та же фраза, появившаяся снова, будет озвучена повторно).
 PAUSE_FRAMES_TO_FORGET = 3
 
-# Максимальный размер очереди озвучки (старое отбрасывается, чтобы не копились задержки).
-MAX_TTS_QUEUE = 3
+# Очередь озвучки. Реплики читаются строго по очереди и не теряются; отбрасываются только
+# те, что ждали дольше MAX_PHRASE_AGE_SECONDS (или не поместились в очередь).
+MAX_TTS_QUEUE = 12
+MAX_PHRASE_AGE_SECONDS = 25.0
+
+# Пауза между репликами из РАЗНЫХ областей (настраивается в окне) и короткая пауза
+# между репликами одной и той же области.
+DEFAULT_AREA_PAUSE = 1.0
+MAX_AREA_PAUSE = 5.0
+SAME_AREA_GAP_SECONDS = 0.15
+
+# Версия формата файла настроек (нужна для переноса старых настроек).
+SETTINGS_VERSION = 2
 
 
 @dataclass
 class Settings:
     """Пользовательские настройки, сохраняемые между запусками."""
 
+    settings_version: int = SETTINGS_VERSION
     ocr_engine: str = DEFAULT_OCR_ENGINE
     tts_model: str = DEFAULT_TTS_MODEL
     speaker: str = DEFAULT_SPEAKER
@@ -129,8 +174,11 @@ class Settings:
     capture_fps: float = DEFAULT_CAPTURE_FPS
     similarity_threshold: int = SIMILARITY_THRESHOLD
     tesseract_path: str = ""
-    # Область захвата: left, top, width, height (в пикселях экрана).
-    roi: list = field(default_factory=lambda: [400, 800, 1100, 120])
+    # Области захвата: список [left, top, width, height] (в пикселях экрана).
+    # Порядок в списке = порядок озвучки, когда реплики появляются одновременно.
+    rois: list = field(default_factory=lambda: [list(DEFAULT_ROI)])
+    # Пауза (секунды) между репликами из разных областей.
+    area_pause: float = DEFAULT_AREA_PAUSE
     overlay_visible: bool = True
 
     # -- сохранение / загрузка -------------------------------------------------
@@ -163,12 +211,31 @@ class Settings:
         if not isinstance(data, dict):
             return settings
 
+        # Файлы версии 1 хранили одну область в поле «roi» — переносим её в список.
+        if "rois" not in data and "roi" in data:
+            data["rois"] = [data["roi"]]
+        data.pop("roi", None)
+
+        old_version = _to_int(data.get("settings_version"), 1)
+
         # Применяем только известные поля, чтобы старые файлы не ломали программу.
         for key, value in data.items():
             if hasattr(settings, key):
                 setattr(settings, key, value)
+        settings._migrate(old_version)
         settings._validate()
         return settings
+
+    def _migrate(self, old_version: int) -> None:
+        """Переносит настройки из файла старой версии."""
+        if old_version < 2:
+            # Прежние 3,5 кадра/с были слишком медленными — берём новое значение по умолчанию.
+            self.capture_fps = DEFAULT_CAPTURE_FPS
+            # v4_ru была моделью по умолчанию, а v5_5_ru ставит ударения заметно точнее.
+            # Выбрать v4_ru снова можно в окне программы.
+            if self.tts_model == "v4_ru":
+                self.tts_model = DEFAULT_TTS_MODEL
+        self.settings_version = SETTINGS_VERSION
 
     def _validate(self) -> None:
         """Приводит значения к допустимым диапазонам."""
@@ -180,19 +247,44 @@ class Settings:
             self.speaker = DEFAULT_SPEAKER
         self.speed = _clamp(_to_float(self.speed, 1.0), 0.5, 2.0)
         self.volume = _clamp(_to_float(self.volume, 1.0), 0.0, 1.0)
-        self.capture_fps = _clamp(_to_float(self.capture_fps, DEFAULT_CAPTURE_FPS), 1.0, 8.0)
+        self.capture_fps = _clamp(
+            _to_float(self.capture_fps, DEFAULT_CAPTURE_FPS), MIN_CAPTURE_FPS, MAX_CAPTURE_FPS
+        )
+        self.area_pause = _clamp(_to_float(self.area_pause, DEFAULT_AREA_PAUSE), 0.0, MAX_AREA_PAUSE)
         self.similarity_threshold = int(
             _clamp(_to_float(self.similarity_threshold, SIMILARITY_THRESHOLD), 50, 100)
         )
-        if (
-            not isinstance(self.roi, (list, tuple))
-            or len(self.roi) != 4
-            or not all(isinstance(v, (int, float)) for v in self.roi)
-        ):
-            self.roi = [400, 800, 1100, 120]
-        else:
-            left, top, width, height = (int(v) for v in self.roi)
-            self.roi = [left, top, max(width, 40), max(height, 20)]
+        self.rois = normalize_rois(self.rois)
+
+
+def normalize_rois(rois) -> list:
+    """
+    Приводит список областей к безопасному виду.
+
+    Некорректные записи отбрасываются, размеры ограничиваются снизу, лишние области
+    (сверх MAX_AREAS) обрезаются. Если ни одной верной области нет — возвращается область
+    по умолчанию, чтобы программе всегда было что захватывать.
+    """
+    cleaned = []
+    if isinstance(rois, (list, tuple)):
+        for roi in rois:
+            if (
+                isinstance(roi, (list, tuple))
+                and len(roi) == 4
+                and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in roi)
+            ):
+                left, top, width, height = (int(v) for v in roi)
+                cleaned.append([left, top, max(width, 40), max(height, 20)])
+            if len(cleaned) >= MAX_AREAS:
+                break
+    return cleaned or [list(DEFAULT_ROI)]
+
+
+def _to_int(value, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _to_float(value, default: float) -> float:

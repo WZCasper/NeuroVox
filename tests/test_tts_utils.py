@@ -14,6 +14,7 @@ import numpy as np  # noqa: E402
 
 import config  # noqa: E402
 import tts_engine as tts  # noqa: E402
+from pronunciation import StressDictionary  # noqa: E402
 
 
 class PrepareTextTests(unittest.TestCase):
@@ -123,6 +124,21 @@ class ModelWithoutExtras:
         return FakeAudio(_fake_samples())
 
 
+class ModelV5:
+    """Как v5_5_ru из официального примера Silero: ударения и разбор омографов."""
+
+    def __init__(self):
+        self.calls = []
+        self.texts = []
+
+    def apply_tts(self, text, speaker, sample_rate, put_accent=False, put_yo=False,
+                  put_stress_homo=False, put_yo_homo=False):
+        self.texts.append(text)
+        self.calls.append({"put_accent": put_accent, "put_yo": put_yo,
+                           "put_stress_homo": put_stress_homo, "put_yo_homo": put_yo_homo})
+        return FakeAudio(_fake_samples())
+
+
 class ModelWithKwargs:
     def apply_tts(self, text, speaker, sample_rate, **kwargs):
         self.kwargs = kwargs
@@ -149,7 +165,8 @@ class SynthesizeTests(unittest.TestCase):
     def test_detects_supported_optional_arguments(self):
         self.assertEqual(tts.detect_optional_kwargs(ModelWithExtras()), ("put_accent", "put_yo"))
         self.assertEqual(tts.detect_optional_kwargs(ModelWithoutExtras()), ())
-        self.assertEqual(tts.detect_optional_kwargs(ModelWithKwargs()), ("put_accent", "put_yo"))
+        self.assertEqual(tts.detect_optional_kwargs(ModelWithKwargs()), tts._OPTIONAL_TTS_KWARGS)
+        self.assertEqual(tts.detect_optional_kwargs(ModelV5()), tts._OPTIONAL_TTS_KWARGS)
 
     def test_passes_optional_arguments_when_supported(self):
         model = ModelWithExtras()
@@ -172,6 +189,55 @@ class SynthesizeTests(unittest.TestCase):
 
     def test_empty_text_gives_no_audio(self):
         self.assertEqual(_engine_with(ModelWithExtras()).synthesize("★▲", "baya"), [])
+
+    def test_homograph_flags_are_enabled_for_v5_model(self):
+        model = ModelV5()
+        _engine_with(model).synthesize("Мы открыли замок.", "baya")
+        self.assertEqual(
+            model.calls[0],
+            {"put_accent": True, "put_yo": True, "put_stress_homo": True, "put_yo_homo": True},
+        )
+
+    def test_old_model_keeps_accent_flags_and_only_loses_homograph_ones(self):
+        # v4_ru: ударения есть, разбора омографов нет. Отказ от одного параметра
+        # не должен отключать остальные (раньше отключались все сразу).
+        model = ModelWithExtras()
+        engine = _engine_with(model)
+        engine._optional_kwargs = tts._OPTIONAL_TTS_KWARGS       # как если бы определение параметров не сработало
+        self.assertEqual(len(engine.synthesize("Привет, мир!", "baya")), 1)
+        self.assertEqual(model.calls[0], {"put_accent": True, "put_yo": True})
+        self.assertEqual(engine._optional_kwargs, ("put_accent", "put_yo"))
+
+    def test_fallback_survives_unparseable_error_message(self):
+        class Strange:
+            def __init__(self):
+                self.calls = 0
+
+            def apply_tts(self, text, speaker, sample_rate, **kwargs):
+                self.calls += 1
+                if kwargs:
+                    raise TypeError("что-то пошло не так")
+                return FakeAudio(_fake_samples())
+
+        model = Strange()
+        engine = _engine_with(model)
+        self.assertEqual(len(engine.synthesize("Привет, мир!", "baya")), 1)
+        self.assertEqual(engine._optional_kwargs, ())
+
+    def test_capital_phrase_is_normalized_before_synthesis(self):
+        model = ModelV5()
+        _engine_with(model).synthesize("КУДА ТЫ ПРОПАЛ?", "baya")
+        self.assertEqual(model.texts[0], "Куда ты пропал?")
+
+    def test_user_stress_dictionary_is_applied(self):
+        model = ModelV5()
+        engine = _engine_with(model)
+        with tempfile.TemporaryDirectory() as folder:
+            path = pathlib.Path(folder) / "stress.txt"
+            path.write_text("геральт = гер+альт\n", encoding="utf-8")
+            engine._dictionary = StressDictionary(path)
+            engine.synthesize("Геральт пришёл.", "baya")
+        self.assertEqual(model.texts[0], "Гер+альт пришёл.")
 
 
 if __name__ == "__main__":

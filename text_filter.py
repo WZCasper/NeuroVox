@@ -143,9 +143,23 @@ class SubtitleFilter:
         self._candidate_count = 0
         self._empty_frames = 0
 
-    def process(self, raw_text: str) -> Optional[str]:
+    def forget(self) -> None:
+        """
+        Реплика закончилась (область субтитров опустела).
+
+        Забываем последнюю озвученную фразу: если такая же появится снова —
+        это новая реплика, и её нужно озвучить.
+        """
+        self.reset()
+
+    def process(self, raw_text: str, settled: bool = False) -> Optional[str]:
         """
         Обрабатывает распознанную строку.
+
+        settled=True означает, что снимок уже признан устоявшимся по картинке
+        (она не менялась заметное время), поэтому ждать подтверждения текста
+        следующими кадрами не нужно. При settled=False действует прежнее правило:
+        текст должен повториться ``stable_frames`` раз подряд.
 
         Возвращает очищенный текст, если его нужно озвучить, иначе None.
         """
@@ -166,7 +180,11 @@ class SubtitleFilter:
         self._empty_frames = 0
 
         # Ждём, пока текст «устоится» (перестанет меняться между кадрами).
-        if self._candidate and self._is_same_growing_phrase(text, self._candidate):
+        if settled:
+            # Устоявшуюся по картинке реплику подтверждать повторно не нужно.
+            self._candidate = text
+            self._candidate_count = self.stable_frames
+        elif self._candidate and self._is_same_growing_phrase(text, self._candidate):
             self._candidate_count += 1
             # Берём более длинную версию: она обычно полнее (дописанный хвост).
             if len(text) > len(self._candidate):

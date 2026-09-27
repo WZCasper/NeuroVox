@@ -13,12 +13,13 @@ import sys
 import time
 import tkinter as tk
 from tkinter import messagebox
-from typing import Dict
+from typing import Dict, List
 
 import customtkinter as ctk
 
 import config
 from overlay import SelectionOverlay
+from pronunciation import StressDictionary
 from workers import EventBus, NeuroVoxEngine, SharedSettings
 
 logger = logging.getLogger("neurovox.gui")
@@ -31,8 +32,8 @@ OCR_LABELS = {
     "tesseract": "Tesseract (быстрый)",
 }
 MODEL_LABELS = {
-    "v4_ru": "Silero v4 (проверенная)",
-    "v5_ru": "Silero v5 (новая)",
+    "v5_5_ru": "Silero v5.5 (точные ударения)",
+    "v4_ru": "Silero v4 (старая, запасная)",
 }
 
 # Цвета статуса.
@@ -40,6 +41,36 @@ COLOR_IDLE = "#8a94a6"
 COLOR_LOADING = "#f5a623"
 COLOR_RUNNING = "#3ddc84"
 COLOR_ERROR = "#ff5c5c"
+
+
+def rects_overlap(a, b) -> bool:
+    """Пересекаются ли два прямоугольника вида (left, top, width, height)."""
+    return a[0] < b[0] + b[2] and b[0] < a[0] + a[2] and a[1] < b[1] + b[3] and b[1] < a[1] + a[3]
+
+
+def find_free_slot(existing, screen_width: int, screen_height: int):
+    """
+    Подбирает место для новой области того же размера, что и последняя из ``existing``.
+
+    Сначала пробуются места ниже и выше последней рамки (с зазором), затем дальше. Место
+    должно помещаться на экране и не перекрывать ни одну из существующих рамок. Если
+    свободного места нет, рамка ставится каскадом — со смещением от последней.
+    """
+    left, top, width, height = existing[-1]
+    step = height + 12
+    for k in range(1, config.MAX_AREAS + 1):
+        for new_top in (top + k * step, top - k * step):
+            if new_top < 0 or new_top + height > screen_height:
+                continue
+            candidate = (left, new_top, width, height)
+            if not any(rects_overlap(candidate, other) for other in existing):
+                return candidate
+    return (
+        min(left + 30, max(0, screen_width - width)),
+        min(top + 30, max(0, screen_height - height)),
+        width,
+        height,
+    )
 
 
 class MainWindow(ctk.CTk):
@@ -51,14 +82,16 @@ class MainWindow(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         self.title(f"{config.APP_NAME} — голос для субтитров")
-        self.geometry("620x760")
-        self.minsize(560, 680)
+        self.geometry("640x900")
+        self.minsize(580, 780)
 
         self.settings = config.Settings.load()
         self.shared = SharedSettings(self.settings)
         self.bus = EventBus()
         self.engine = NeuroVoxEngine(self.shared, self.bus)
-        self.overlay: SelectionOverlay = None  # создаётся после построения интерфейса
+        self.overlays: List[SelectionOverlay] = []   # по одной рамке на область; создаются после интерфейса
+        self._area_widgets: List[ctk.CTkBaseClass] = []
+        self._stress_dictionary = StressDictionary()
 
         self._voice_by_label: Dict[str, str] = {label: key for key, label in config.SILERO_SPEAKERS.items()}
         self._engine_by_label: Dict[str, str] = {label: key for key, label in OCR_LABELS.items()}
@@ -66,11 +99,14 @@ class MainWindow(ctk.CTk):
         self._starting = False
 
         self._build_ui()
-        self._create_overlay()
+        self._create_overlays()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(POLL_INTERVAL_MS, self._poll_events)
-        self._log("Добро пожаловать в NeuroVox! Наведите рамку на субтитры и нажмите «Запустить».")
+        self._log(
+            "Добро пожаловать в NeuroVox! Наведите рамку на субтитры и нажмите «Запустить». "
+            "Если субтитры бывают в нескольких местах экрана, добавьте ещё области кнопкой «+»."
+        )
 
     # ------------------------------------------------------------------
     # Построение интерфейса
@@ -78,7 +114,7 @@ class MainWindow(ctk.CTk):
 
     def _build_ui(self) -> None:
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(3, weight=1)
+        self.grid_rowconfigure(4, weight=1)
 
         # -- шапка ----------------------------------------------------------
         header = ctk.CTkFrame(self, corner_radius=12)
@@ -111,7 +147,7 @@ class MainWindow(ctk.CTk):
         self.start_button.grid(row=0, column=0, columnspan=2, padx=16, pady=(16, 8), sticky="ew")
 
         self.overlay_button = ctk.CTkButton(
-            controls, text="Скрыть рамку", command=self._toggle_overlay, fg_color="#3a4358", hover_color="#2d3547",
+            controls, text="Скрыть рамки", command=self._toggle_overlay, fg_color="#3a4358", hover_color="#2d3547",
         )
         self.overlay_button.grid(row=1, column=0, padx=(16, 6), pady=(0, 16), sticky="ew")
 
@@ -125,9 +161,29 @@ class MainWindow(ctk.CTk):
         self.progress.set(0)
         # Полоса прогресса показывается только во время загрузки моделей.
 
+        # -- области субтитров -----------------------------------------------
+        areas = ctk.CTkFrame(self, corner_radius=12)
+        areas.grid(row=2, column=0, padx=16, pady=8, sticky="ew")
+        areas.grid_columnconfigure(0, weight=1)
+
+        areas_header = ctk.CTkFrame(areas, fg_color="transparent")
+        areas_header.grid(row=0, column=0, padx=12, pady=(10, 0), sticky="ew")
+        areas_header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(areas_header, text="Области субтитров (читаются по очереди)", anchor="w").grid(
+            row=0, column=0, sticky="w"
+        )
+        self.add_area_button = ctk.CTkButton(
+            areas_header, text="+  Добавить область", width=160, height=28, command=self._add_area,
+        )
+        self.add_area_button.grid(row=0, column=1, sticky="e")
+
+        self.area_rows = ctk.CTkFrame(areas, fg_color="transparent")
+        self.area_rows.grid(row=1, column=0, padx=12, pady=(4, 10), sticky="ew")
+        self.area_rows.grid_columnconfigure(1, weight=1)
+
         # -- настройки ------------------------------------------------------
         options = ctk.CTkFrame(self, corner_radius=12)
-        options.grid(row=2, column=0, padx=16, pady=8, sticky="ew")
+        options.grid(row=3, column=0, padx=16, pady=8, sticky="ew")
         options.grid_columnconfigure(1, weight=1)
 
         def add_row(row: int, caption: str) -> None:
@@ -178,14 +234,33 @@ class MainWindow(ctk.CTk):
         self.model_menu.set(MODEL_LABELS.get(self.settings.tts_model, MODEL_LABELS[config.DEFAULT_TTS_MODEL]))
         self.model_menu.grid(row=4, column=1, padx=(0, 16), pady=8, sticky="ew")
 
-        add_row(5, "Язык распознавания")
-        ctk.CTkLabel(options, text="Русский (ru)", anchor="w", text_color=COLOR_IDLE).grid(
-            row=5, column=1, padx=(0, 16), pady=(8, 12), sticky="w"
+        add_row(5, "Пауза между областями")
+        pause_frame = ctk.CTkFrame(options, fg_color="transparent")
+        pause_frame.grid(row=5, column=1, padx=(0, 16), pady=8, sticky="ew")
+        pause_frame.grid_columnconfigure(0, weight=1)
+        self.pause_slider = ctk.CTkSlider(
+            pause_frame, from_=0.0, to=config.MAX_AREA_PAUSE,
+            number_of_steps=int(config.MAX_AREA_PAUSE * 10), command=self._on_pause_change,
         )
+        self.pause_slider.set(self.settings.area_pause)
+        self.pause_slider.grid(row=0, column=0, sticky="ew")
+        self.pause_value = ctk.CTkLabel(pause_frame, text=f"{self.settings.area_pause:.1f} с", width=54)
+        self.pause_value.grid(row=0, column=1, padx=(8, 0))
+
+        add_row(6, "Язык распознавания")
+        ctk.CTkLabel(options, text="Русский (ru)", anchor="w", text_color=COLOR_IDLE).grid(
+            row=6, column=1, padx=(0, 16), pady=8, sticky="w"
+        )
+
+        add_row(7, "Ударения в словах")
+        ctk.CTkButton(
+            options, text="Открыть словарь ударений", command=self._open_stress_dictionary,
+            fg_color="#3a4358", hover_color="#2d3547",
+        ).grid(row=7, column=1, padx=(0, 16), pady=(8, 12), sticky="ew")
 
         # -- журнал ---------------------------------------------------------
         log_frame = ctk.CTkFrame(self, corner_radius=12)
-        log_frame.grid(row=3, column=0, padx=16, pady=(8, 16), sticky="nsew")
+        log_frame.grid(row=4, column=0, padx=16, pady=(8, 16), sticky="nsew")
         log_frame.grid_columnconfigure(0, weight=1)
         log_frame.grid_rowconfigure(1, weight=1)
 
@@ -208,12 +283,85 @@ class MainWindow(ctk.CTk):
         self.log_box.grid(row=1, column=0, padx=12, pady=(6, 12), sticky="nsew")
         self.log_box.configure(state="disabled")
 
-    def _create_overlay(self) -> None:
-        roi = tuple(self.settings.roi)
-        self.overlay = SelectionOverlay(self, roi, on_change=self._on_roi_change)
+    def _create_overlays(self) -> None:
+        for index, roi in enumerate(self.settings.rois):
+            overlay = SelectionOverlay(self, tuple(roi), on_change=self._on_roi_change, index=index)
+            if not self.settings.overlay_visible:
+                overlay.hide()
+            self.overlays.append(overlay)
         if not self.settings.overlay_visible:
-            self.overlay.hide()
-            self.overlay_button.configure(text="Показать рамку")
+            self.overlay_button.configure(text="Показать рамки")
+        self._rebuild_area_rows()
+
+    def _suggest_new_roi(self):
+        """Свободное место для новой рамки рядом с уже существующими."""
+        existing = [overlay.get_roi() for overlay in self.overlays]
+        return find_free_slot(existing, self.winfo_screenwidth(), self.winfo_screenheight())
+
+    def _add_area(self) -> None:
+        if len(self.overlays) >= config.MAX_AREAS:
+            self._log(f"⚠ Больше {config.MAX_AREAS} областей добавить нельзя.")
+            return
+        overlay = SelectionOverlay(
+            self, self._suggest_new_roi(), on_change=self._on_roi_change, index=len(self.overlays)
+        )
+        self.overlays.append(overlay)
+        if not self.settings.overlay_visible:
+            # Пользователь только что добавил область — ему нужно её увидеть.
+            self._set_overlays_visible(True)
+        self._sync_rois()
+        self._rebuild_area_rows()
+        self._log(
+            f"Добавлена область {len(self.overlays)}. Перетащите рамку на нужное место "
+            "и потяните за угол, чтобы изменить размер."
+        )
+
+    def _remove_area(self, index: int) -> None:
+        if len(self.overlays) <= 1 or not 0 <= index < len(self.overlays):
+            return
+        overlay = self.overlays.pop(index)
+        try:
+            overlay.destroy()
+        except tk.TclError:
+            pass
+        for number, remaining in enumerate(self.overlays):
+            remaining.set_index(number)
+        self._sync_rois()
+        self._rebuild_area_rows()
+        self._log(f"Область {index + 1} удалена.")
+
+    def _rebuild_area_rows(self) -> None:
+        """Перерисовывает список областей в окне."""
+        for widget in self._area_widgets:
+            widget.destroy()
+        self._area_widgets = []
+
+        can_remove = len(self.overlays) > 1
+        for index, overlay in enumerate(self.overlays):
+            dot = ctk.CTkLabel(self.area_rows, text="●", text_color=overlay.color, width=24)
+            dot.grid(row=index, column=0, pady=2)
+            title = ctk.CTkLabel(self.area_rows, text=f"Область {index + 1}", anchor="w")
+            title.grid(row=index, column=1, padx=(4, 0), pady=2, sticky="w")
+            remove = ctk.CTkButton(
+                self.area_rows, text="×", width=30, height=24, font=ctk.CTkFont(size=16, weight="bold"),
+                fg_color="#3a4358", hover_color="#992d22",
+                state="normal" if can_remove else "disabled",
+                command=lambda i=index: self._remove_area(i),
+            )
+            remove.grid(row=index, column=2, pady=2, sticky="e")
+            self._area_widgets += [dot, title, remove]
+
+        self.add_area_button.configure(state="normal" if len(self.overlays) < config.MAX_AREAS else "disabled")
+
+    def _set_overlays_visible(self, visible: bool) -> None:
+        for overlay in self.overlays:
+            if visible:
+                overlay.show()
+            else:
+                overlay.hide()
+        self.overlay_button.configure(text="Скрыть рамки" if visible else "Показать рамки")
+        self.shared.update(overlay_visible=visible)
+        self.settings.overlay_visible = visible
 
     # ------------------------------------------------------------------
     # Обработчики действий
@@ -226,8 +374,8 @@ class MainWindow(ctk.CTk):
             self._start()
 
     def _start(self) -> None:
-        # Сохраняем актуальную область на случай, если пользователь двигал рамку.
-        self._on_roi_change(self.overlay.get_roi())
+        # Сохраняем актуальные области на случай, если пользователь двигал рамки.
+        self._sync_rois()
         self._starting = True
         self.settings.save()
         self._set_status("Подготовка...", COLOR_LOADING)
@@ -241,25 +389,41 @@ class MainWindow(ctk.CTk):
         self.start_button.configure(state="disabled")
 
     def _toggle_overlay(self) -> None:
-        if self.overlay.is_visible():
-            self.overlay.hide()
-            self.overlay_button.configure(text="Показать рамку")
-            self.shared.update(overlay_visible=False)
-            self.settings.overlay_visible = False
-        else:
-            self.overlay.show()
-            self.overlay_button.configure(text="Скрыть рамку")
-            self.shared.update(overlay_visible=True)
-            self.settings.overlay_visible = True
+        self._set_overlays_visible(not any(overlay.is_visible() for overlay in self.overlays))
 
     def _preview_voice(self) -> None:
         self._log("Проверка голоса...")
         self.engine.preview_voice()
 
-    def _on_roi_change(self, roi) -> None:
-        roi_list = [int(v) for v in roi]
-        self.shared.update(roi=roi_list)
-        self.settings.roi = roi_list
+    def _on_roi_change(self, _roi=None) -> None:
+        """Пользователь подвинул или растянул одну из рамок — запоминаем все области."""
+        self._sync_rois()
+
+    def _sync_rois(self) -> None:
+        rois = [[int(v) for v in overlay.get_roi()] for overlay in self.overlays]
+        self.shared.update(rois=rois)
+        self.settings.rois = rois
+
+    def _on_pause_change(self, value: float) -> None:
+        value = round(float(value), 1)
+        self.pause_value.configure(text=f"{value:.1f} с")
+        self.shared.update(area_pause=value)
+        self.settings.area_pause = value
+
+    def _open_stress_dictionary(self) -> None:
+        """Открывает словарь ударений в «Блокноте» (файл создаётся с инструкцией при первом открытии)."""
+        try:
+            path = self._stress_dictionary.ensure_file()
+            if sys.platform == "win32":
+                os.startfile(str(path))  # noqa: S606 — открываем свой файл
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+            self._log(
+                "Словарь ударений открыт. Впишите слово и его вариант с ударением (знак + перед ударной "
+                "гласной), сохраните файл — программа подхватит изменения сама."
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"⚠ Не удалось открыть словарь ударений: {exc}")
 
     def _on_voice_change(self, label: str) -> None:
         speaker = self._voice_by_label.get(label, config.DEFAULT_SPEAKER)
@@ -380,13 +544,14 @@ class MainWindow(ctk.CTk):
             if not messagebox.askyesno("Выход", "Озвучка ещё работает. Закрыть программу?"):
                 return
         try:
-            self._on_roi_change(self.overlay.get_roi())
+            self._sync_rois()
             self.settings.save()
         except Exception:  # noqa: BLE001
             logger.exception("Не удалось сохранить настройки при выходе")
         self.engine.stop()
-        try:
-            self.overlay.destroy()
-        except tk.TclError:
-            pass
+        for overlay in self.overlays:
+            try:
+                overlay.destroy()
+            except tk.TclError:
+                pass
         self.destroy()

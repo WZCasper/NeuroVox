@@ -191,11 +191,115 @@ def check_gui(rep: Report) -> None:
             app.update()
             time.sleep(0.05)
         rep.ok(f"главное окно создано: «{app.title()}»")
-        app.overlay.set_roi((50, 50, 300, 80))
+        rep.ok(f"области при запуске: {len(app.overlays)} (по умолчанию — одна)")
+
+        app._add_area()
         app.update()
-        rep.ok(f"прозрачная рамка создана, область {app.overlay.get_roi()}")
+        if len(app.overlays) != 2:
+            rep.fail(f"кнопка «+» должна была добавить область, областей стало {len(app.overlays)}")
+        else:
+            rep.ok(f"кнопка «+» добавляет область: областей стало {len(app.overlays)}")
+
+        app.overlays[0].set_roi((50, 50, 300, 80))
+        app.update()
+        rois = [overlay.get_roi() for overlay in app.overlays]
+        if rois[0] != (50, 50, 300, 80):
+            rep.fail(f"перемещение рамки не сохранилось: {rois[0]}")
+        else:
+            rep.ok(f"прозрачные рамки работают, области: {rois}")
+
+        app._remove_area(1)
+        app.update()
+        if len(app.overlays) != 1:
+            rep.fail(f"удаление области не сработало, осталось {len(app.overlays)}")
+        else:
+            rep.ok("удаление лишней области работает")
     finally:
         app.destroy()
+
+
+def check_pronunciation(rep: Report) -> None:
+    from pronunciation import StressDictionary, normalize_caps
+
+    if normalize_caps("КУДА ТЫ ПРОПАЛ?") != "Куда ты пропал?":
+        rep.fail("нормализация капса субтитров работает неверно")
+    else:
+        rep.ok("нормализация субтитров, набранных капсом, работает")
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "stress_dict.txt"
+        created = StressDictionary(path).ensure_file()
+        if not created.exists() or "Словарь ударений" not in created.read_text(encoding="utf-8-sig"):
+            rep.fail("файл словаря ударений не создаётся с инструкцией")
+        else:
+            rep.ok("словарь ударений создаётся с инструкцией при первом обращении")
+
+        path.write_text("геральт = гер+альт\n", encoding="utf-8")
+        sd = StressDictionary(path)
+        result = sd.apply("Геральт пришёл.")
+        if result != "Гер+альт пришёл.":
+            rep.fail(f"словарь ударений применяется неверно: {result!r}")
+        else:
+            rep.ok("пользовательский словарь ударений применяется корректно")
+
+
+def check_frame_pipeline(rep: Report) -> None:
+    """
+    Проверяет связку «трекер области -> буфер -> распознавание» без реального экрана:
+    печатающийся, затем повторяющийся субтитр должен дать ровно две реплики (после
+    паузы фраза повторяется и должна прозвучать снова), а не одну и не три.
+    """
+    import numpy as np
+
+    from capture import AreaTracker, preprocess_for_ocr
+    from frame_buffer import FrameBuffer
+    from text_filter import SubtitleFilter
+
+    def frame(text: str) -> np.ndarray:
+        import cv2
+
+        image = np.full((100, 700, 3), (30, 34, 50), dtype=np.uint8)
+        cv2.putText(image, text, (16, 65), cv2.FONT_HERSHEY_SIMPLEX, 1.3, (255, 255, 255), 3)
+        return preprocess_for_ocr(image)
+
+    tracker = AreaTracker(settle_time=0.05, max_wait=0.3, empty_hold=0.05)
+    buffer = FrameBuffer(retention=1.0, max_unread_age=5.0)
+    subtitle_filter = SubtitleFilter(threshold=85)
+    spoken = []
+
+    # Печать по буквам (шаг короче settle_time — фраза ещё не отправлена), затем текст
+    # держится неизменным дольше settle_time (отправлен), потом исчезает дольше empty_hold
+    # (отправлена метка «опустела»), и наконец та же фраза появляется снова.
+    script = [
+        (0.00, "П"), (0.02, "ПР"), (0.04, "ПРИ"), (0.06, "ПРИВЕТ"),
+        (0.14, "ПРИВЕТ"),      # держится дольше settle_time (0.06 -> 0.14 = 0.08 с)
+        (0.20, None),
+        (0.30, None),          # пусто дольше empty_hold (0.20 -> 0.30 = 0.10 с)
+        (0.35, "ПРИВЕТ"),
+        (0.43, "ПРИВЕТ"),      # снова держится дольше settle_time
+    ]
+    for now, text in script:
+        commit = tracker.update(frame(text) if text else None, now=now)
+        if commit is not None:
+            buffer.put(area=0, image=commit.image, settled=commit.settled, captured_at=now)
+
+    while True:
+        found = buffer.take_next(timeout=0.01)
+        if found is None:
+            break
+        if found.image is None:
+            subtitle_filter.forget()
+            continue
+        phrase = subtitle_filter.process("ПРИВЕТ", settled=found.settled)
+        if phrase:
+            spoken.append(phrase)
+
+    if spoken != ["ПРИВЕТ", "ПРИВЕТ"]:
+        rep.fail(f"конвейер снимков дал {spoken!r}, ожидалось: фраза повторяется дважды")
+    else:
+        rep.ok("быстрая смена и повтор субтитра обрабатываются верно (буфер снимков + трекер)")
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +433,8 @@ def run(strict: bool = False, models: bool = False, out_path: Optional[str] = No
     _step(rep, "Фильтр повторов", check_filter)
     _step(rep, "Захват экрана", check_capture)
     _step(rep, "Интерфейс", check_gui)
+    _step(rep, "Произношение и словарь ударений", check_pronunciation)
+    _step(rep, "Конвейер снимков (несколько областей, быстрая смена)", check_frame_pipeline)
     if models:
         _step(rep, "Озвучка Silero", check_tts)
         _step(rep, "Распознавание EasyOCR", check_ocr)
