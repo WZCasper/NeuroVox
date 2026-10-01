@@ -27,6 +27,29 @@ def _typing_frame(text):
     return frame
 
 
+def _gradient_frame_with_outlined_text(text="ПРИВЕТ КАК ДЕЛА", light_on_dark=True, size=(150, 900)):
+    """
+    Кадр с ЗАМЕТНЫМ перепадом яркости фона слева направо (одна половина фразы
+    может лежать на тёмной части сцены, другая — на светлой) и обводкой текста
+    контрастным цветом — типичная игровая ситуация, когда субтитр показан
+    прямо поверх сцены, а не на отдельной ровной плашке.
+    """
+    height, width = size
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    for x in range(width):
+        # Разброс яркости фона намеренно широкий (от тёмного до светлого),
+        # чтобы результат уверенно попадал в неоднородную ветку обработки —
+        # именно такой перепад ломает единый порог Оцу.
+        value = int(20 + (x / width) * 190)
+        frame[:, x] = (value, value, value)
+    text_color = (255, 255, 255) if light_on_dark else (20, 20, 20)
+    outline_color = (0, 0, 0) if light_on_dark else (255, 255, 255)
+    origin = (25, int(height * 0.62))
+    cv2.putText(frame, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 1.5, outline_color, 7, cv2.LINE_AA)
+    cv2.putText(frame, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 1.5, text_color, 2, cv2.LINE_AA)
+    return frame
+
+
 class PreprocessTests(unittest.TestCase):
     def test_light_text_on_dark_gives_black_on_white_with_padding(self):
         image = capture.preprocess_for_ocr(_frame_with_text(True))
@@ -47,6 +70,98 @@ class PreprocessTests(unittest.TestCase):
     def test_none_and_empty_input(self):
         self.assertIsNone(capture.preprocess_for_ocr(None))
         self.assertIsNone(capture.preprocess_for_ocr(np.zeros((0, 0, 3), dtype=np.uint8)))
+
+
+class AdaptiveBinarizationTests(unittest.TestCase):
+    """
+    Проверяет ветку адаптивной бинаризации: субтитр наложен прямо на сцену
+    с заметным перепадом яркости фона, где у метода Оцу нет единого верного
+    порога (см. BACKGROUND_UNIFORMITY_STD_THRESHOLD в capture.py).
+    """
+
+    def test_uniform_background_alone_is_below_threshold(self):
+        # Критерий переключения смотрит на РАЗБРОС ЯРКОСТИ ВСЕГО КАДРА, поэтому
+        # крупный контрастный текст сам по себе поднимает std независимо от
+        # фона — это не брак критерия, а следствие того, что текст обязан
+        # отличаться от фона. Проверяем сам признак на однородном ФОНЕ БЕЗ
+        # текста — том самом, на котором построена плашка в _frame_with_text.
+        background_only = np.full((100, 600), 30, dtype=np.uint8)
+        self.assertLess(float(np.std(background_only)), capture.BACKGROUND_UNIFORMITY_STD_THRESHOLD)
+
+    def test_gradient_background_alone_is_above_threshold(self):
+        height, width = 150, 900
+        gray = np.zeros((height, width), dtype=np.uint8)
+        for x in range(width):
+            gray[:, x] = int(20 + (x / width) * 190)
+        self.assertGreaterEqual(float(np.std(gray)), capture.BACKGROUND_UNIFORMITY_STD_THRESHOLD)
+
+    def test_outlined_text_on_gradient_is_recognized_as_text(self):
+        # Главный сценарий задачи: текст с обводкой поверх фона с явным перепадом
+        # яркости. Раньше здесь метод Оцу либо заливал шумом светлую половину
+        # кадра, либо терял текст на тёмной — итоговая доля «текста» уходила
+        # далеко за пределы разумного диапазона. Новый код обязан вернуть
+        # изображение (не None) с долей белого текста в допустимых пределах.
+        image = capture.preprocess_for_ocr(_gradient_frame_with_outlined_text())
+        self.assertIsNotNone(image)
+        black_ratio = 1.0 - float(np.count_nonzero(image)) / image.size
+        self.assertGreaterEqual(black_ratio, capture.MIN_TEXT_PIXEL_RATIO)
+        self.assertLessEqual(black_ratio, capture.MAX_TEXT_PIXEL_RATIO)
+
+    def test_outlined_dark_text_on_gradient_is_also_recognized(self):
+        # Обратная полярность: тёмный текст с белой обводкой на том же градиенте.
+        image = capture.preprocess_for_ocr(_gradient_frame_with_outlined_text(light_on_dark=False))
+        self.assertIsNotNone(image)
+        black_ratio = 1.0 - float(np.count_nonzero(image)) / image.size
+        self.assertGreaterEqual(black_ratio, capture.MIN_TEXT_PIXEL_RATIO)
+        self.assertLessEqual(black_ratio, capture.MAX_TEXT_PIXEL_RATIO)
+
+    def test_result_shape_and_padding_match_uniform_path(self):
+        # Независимо от того, какая ветка бинаризации сработала внутри, форма
+        # результата и белые поля вокруг текста должны быть одинаковыми — это
+        # важно для frames_are_similar (сравнивает кадры по форме) и для
+        # остального конвейера, который не должен замечать, какой путь выбран.
+        image = capture.preprocess_for_ocr(_gradient_frame_with_outlined_text())
+        self.assertIsNotNone(image)
+        self.assertEqual(
+            image.shape,
+            (150 * capture.UPSCALE_FACTOR + 2 * capture.OCR_PADDING,
+             900 * capture.UPSCALE_FACTOR + 2 * capture.OCR_PADDING),
+        )
+        self.assertTrue((image[: capture.OCR_PADDING] == 255).all())  # поля белые
+
+    def test_empty_gradient_background_without_text_is_skipped(self):
+        # Неоднородный фон сам по себе (без текста) не должен приниматься за текст.
+        height, width = 150, 900
+        frame = np.zeros((height, width, 3), dtype=np.uint8)
+        for x in range(width):
+            value = int(20 + (x / width) * 190)
+            frame[:, x] = (value, value, value)
+        self.assertIsNone(capture.preprocess_for_ocr(frame))
+
+    def test_remove_small_components_keeps_large_and_drops_small(self):
+        # Прямая проверка вспомогательной функции очистки шума: маленькая
+        # шумная точка исчезает, крупная область (аналог настоящей буквы) —
+        # остаётся без изменений.
+        binary = np.zeros((60, 60), dtype=np.uint8)
+        binary[5:6, 5:6] = 255      # «шум»: область из 1 пикселя
+        binary[20:40, 20:40] = 255  # «буква»: область 20x20 = 400 пикселей
+        cleaned = capture._remove_small_components(binary, min_area=10)
+        self.assertEqual(cleaned[5, 5], 0)
+        self.assertTrue((cleaned[20:40, 20:40] == 255).all())
+
+    def test_adaptive_binarize_helper_returns_text_as_white(self):
+        # Прямая проверка _binarize_adaptive в отрыве от подбора ветки: на
+        # кадре с заведомо неоднородным фоном текст должен стать белым (255),
+        # а доля белых пикселей — оставаться в разумных пределах (не залитый
+        # шумом кадр).
+        gray = cv2.cvtColor(_gradient_frame_with_outlined_text(), cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, None, fx=capture.UPSCALE_FACTOR, fy=capture.UPSCALE_FACTOR,
+                           interpolation=cv2.INTER_CUBIC)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        binary = capture._binarize_adaptive(gray)
+        white_ratio = float(np.count_nonzero(binary)) / binary.size
+        self.assertGreaterEqual(white_ratio, capture.MIN_TEXT_PIXEL_RATIO)
+        self.assertLessEqual(white_ratio, capture.MAX_TEXT_PIXEL_RATIO)
 
 
 class SimilarityTests(unittest.TestCase):

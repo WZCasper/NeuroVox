@@ -5,6 +5,7 @@ import contextlib
 import pathlib
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -153,6 +154,30 @@ def _engine_with(model):
     return engine
 
 
+@contextlib.contextmanager
+def _fake_torch_environment(model):
+    """
+    Подменяет модуль ``torch`` целиком, чтобы можно было вызвать настоящий
+    ``SileroTts.load()`` (а не копировать его логику в тесте) без реального
+    PyTorch и без скачивания файла модели.
+    """
+    model.to = lambda device: None
+    fake_package = types.SimpleNamespace(
+        PackageImporter=lambda path: types.SimpleNamespace(
+            load_pickle=lambda group, name: model
+        )
+    )
+    fake_torch = types.SimpleNamespace(
+        set_num_threads=lambda n: None,
+        device=lambda name: name,
+        package=fake_package,
+        inference_mode=FakeTorch.inference_mode,
+    )
+    with mock.patch.object(tts, "download_model", return_value=pathlib.Path("fake_model.pt")), \
+            mock.patch.dict(sys.modules, {"torch": fake_torch, "torch.package": fake_package}):
+        yield
+
+
 class SynthesizeTests(unittest.TestCase):
     def test_without_load_gives_clear_error(self):
         with self.assertRaises(tts.TtsError) as ctx:
@@ -238,6 +263,161 @@ class SynthesizeTests(unittest.TestCase):
             engine._dictionary = StressDictionary(path)
             engine.synthesize("Геральт пришёл.", "baya")
         self.assertEqual(model.texts[0], "Гер+альт пришёл.")
+
+    def test_repeated_phrase_does_not_call_model_again(self):
+        # Основное требование: повторная фраза (тот же текст, голос, скорость)
+        # отдаётся из кэша, а model.apply_tts вызывается только один раз.
+        model = ModelV5()
+        engine = _engine_with(model)
+        first = engine.synthesize("Осторожно, засада!", "baya")
+        second = engine.synthesize("Осторожно, засада!", "baya")
+        self.assertEqual(len(model.calls), 1)
+        self.assertEqual(len(first), len(second))
+        for a, b in zip(first, second):
+            np.testing.assert_array_equal(a, b)
+
+    def test_repeated_phrase_with_different_speed_calls_model_again(self):
+        # Скорость входит в ключ кэша: то же самое произнесённое быстрее или
+        # медленнее — это другой результат, а не то же самое аудио.
+        model = ModelV5()
+        engine = _engine_with(model)
+        engine.synthesize("Осторожно, засада!", "baya", speed=1.0)
+        engine.synthesize("Осторожно, засада!", "baya", speed=1.4)
+        self.assertEqual(len(model.calls), 2)
+
+    def test_repeated_phrase_with_different_speaker_calls_model_again(self):
+        model = ModelV5()
+        engine = _engine_with(model)
+        engine.synthesize("Осторожно, засада!", "baya")
+        engine.synthesize("Осторожно, засада!", "aidar")
+        self.assertEqual(len(model.calls), 2)
+
+    def test_cache_key_uses_text_after_stress_dictionary_and_caps_normalization(self):
+        # Ключ кэша строится из ИТОГОВОГО текста (после normalize_caps и словаря
+        # ударений): два разных сырых текста, дающих одинаковый итоговый текст,
+        # обязаны считаться одной и той же фразой и не приводить ко второму
+        # обращению к модели.
+        model = ModelV5()
+        engine = _engine_with(model)
+        with tempfile.TemporaryDirectory() as folder:
+            path = pathlib.Path(folder) / "stress.txt"
+            path.write_text("геральт = гер+альт\n", encoding="utf-8")
+            engine._dictionary = StressDictionary(path)
+            engine.synthesize("Геральт пришёл.", "baya")
+            # КАПС даёт тот же нормализованный текст после normalize_caps + словаря.
+            engine.synthesize("ГЕРАЛЬТ ПРИШЁЛ.", "baya")
+        self.assertEqual(len(model.calls), 1)
+        self.assertEqual(model.texts[0], "Гер+альт пришёл.")
+
+    def test_cache_survives_reload_of_same_model(self):
+        # Повторный load() с тем же именем модели — обычный no-op (модель уже
+        # загружена), а не «смена модели»: кэш не должен опустошаться.
+        model = ModelV5()
+        engine = _engine_with(model)
+        engine.synthesize("Привет!", "baya")
+        with _fake_torch_environment(model):
+            engine.load()  # self._model уже не None -> сразу вернётся, ничего не изменив
+        self.assertEqual(len(engine._cache), 1)
+
+    def test_loading_different_model_clears_cache(self):
+        # Настоящий сквозной сценарий: SileroTts.load() с другим model_name
+        # должен опустошить кэш — старое аудио синтезировано другой моделью.
+        model_a = ModelV5()
+        engine = tts.SileroTts("v5_5_ru")
+        with _fake_torch_environment(model_a):
+            engine.load()
+        engine.synthesize("Привет!", "baya")
+        self.assertEqual(len(engine._cache), 1)
+
+        model_b = ModelV5()
+        engine.model_name = "v4_ru"
+        engine._model = None  # иначе load() сочтёт, что модель уже загружена, и ничего не сделает
+        with _fake_torch_environment(model_b):
+            engine.load()
+        self.assertEqual(len(engine._cache), 0)
+
+        engine.synthesize("Привет!", "baya")
+        self.assertEqual(len(model_b.calls), 1)  # обратились к НОВОЙ модели, не к кэшу старой
+
+
+class SynthesisCacheTests(unittest.TestCase):
+    """Прямые тесты _SynthesisCache — вытеснение по объёму, а не по числу записей."""
+
+    def _make_fragment(self, num_samples):
+        return [np.ones(num_samples, dtype=np.float32)]
+
+    def test_get_missing_key_returns_none(self):
+        cache = tts._SynthesisCache(sample_rate=1000, max_seconds=1.0)
+        self.assertIsNone(cache.get(("нет такой фразы",)))
+
+    def test_put_then_get_returns_equal_but_independent_copy(self):
+        cache = tts._SynthesisCache(sample_rate=1000, max_seconds=1.0)
+        original = self._make_fragment(100)
+        cache.put(("фраза",), original)
+        retrieved = cache.get(("фраза",))
+        np.testing.assert_array_equal(retrieved[0], original[0])
+        self.assertIsNot(retrieved[0], original[0])   # копия, а не та же ссылка
+        # Мутация возвращённой копии не должна повредить то, что лежит в кэше.
+        retrieved[0][0] = -999.0
+        self.assertEqual(cache.get(("фраза",))[0][0], 1.0)
+
+    def test_eviction_drops_least_recently_used_entry(self):
+        # Лимит в 1000 семплов; три записи по 400 не помещаются одновременно —
+        # при добавлении третьей должна уйти первая (наименее давно нужная).
+        cache = tts._SynthesisCache(sample_rate=1000, max_seconds=1.0)
+        cache.put(("a",), self._make_fragment(400))
+        cache.put(("b",), self._make_fragment(400))
+        cache.put(("c",), self._make_fragment(400))
+        self.assertIsNone(cache.get(("a",)))
+        self.assertIsNotNone(cache.get(("b",)))
+        self.assertIsNotNone(cache.get(("c",)))
+
+    def test_get_refreshes_recency_and_protects_from_eviction(self):
+        cache = tts._SynthesisCache(sample_rate=1000, max_seconds=1.0)
+        cache.put(("x",), self._make_fragment(300))
+        cache.put(("y",), self._make_fragment(300))
+        cache.put(("z",), self._make_fragment(300))
+        cache.get(("x",))  # «освежаем» x — теперь y самый давний
+        cache.put(("w",), self._make_fragment(300))  # должен вытеснить y, не x
+        self.assertIsNotNone(cache.get(("x",)))
+        self.assertIsNone(cache.get(("y",)))
+        self.assertIsNotNone(cache.get(("z",)))
+        self.assertIsNotNone(cache.get(("w",)))
+
+    def test_updating_existing_key_does_not_double_count_its_size(self):
+        # Повторная запись по тому же ключу заменяет старое значение, а не
+        # добавляется поверх него — суммарный объём не должен «раздуваться».
+        cache = tts._SynthesisCache(sample_rate=1000, max_seconds=1.0)
+        cache.put(("a",), self._make_fragment(400))
+        cache.put(("a",), self._make_fragment(400))
+        self.assertEqual(cache._total_samples, 400)
+        self.assertEqual(len(cache), 1)
+
+    def test_fragment_larger_than_whole_cache_is_not_stored(self):
+        # Одна фраза длиннее лимита всего кэша целиком — хранить её бессмысленно
+        # (она одна вытеснила бы всё остальное), поэтому она просто не кэшируется.
+        cache = tts._SynthesisCache(sample_rate=1000, max_seconds=1.0)
+        cache.put(("огромная фраза",), self._make_fragment(1001))
+        self.assertIsNone(cache.get(("огромная фраза",)))
+        self.assertEqual(len(cache), 0)
+
+    def test_clear_empties_cache(self):
+        cache = tts._SynthesisCache(sample_rate=1000, max_seconds=1.0)
+        cache.put(("a",), self._make_fragment(100))
+        cache.clear()
+        self.assertEqual(len(cache), 0)
+        self.assertIsNone(cache.get(("a",)))
+
+    def test_zero_max_seconds_disables_caching(self):
+        # Лимит 0 — кэш полностью выключен (например, для отладки), а не ошибка.
+        cache = tts._SynthesisCache(sample_rate=1000, max_seconds=0.0)
+        cache.put(("a",), self._make_fragment(10))
+        self.assertIsNone(cache.get(("a",)))
+
+    def test_default_limit_matches_config(self):
+        cache = tts._SynthesisCache(sample_rate=config.TTS_SAMPLE_RATE)
+        expected = int(config.TTS_CACHE_MAX_SECONDS * config.TTS_SAMPLE_RATE)
+        self.assertEqual(cache._max_samples, expected)
 
 
 if __name__ == "__main__":

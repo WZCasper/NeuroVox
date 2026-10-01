@@ -306,6 +306,74 @@ class CaptureWorker(_LoopWorker):
             logger.info("Поток снимков остановлен.")
 
 
+class _AreaHealthMonitor:
+    """
+    Отслеживает по каждой области, давно ли не было распознано ни одной фразы,
+    и решает, когда пора предупредить пользователя, что рамка, возможно, смотрит
+    не на игру (окно передвинули, сменили монитор/разрешение и т. п.).
+
+    Идея простая: если конкретная область ЖИВАЯ (приходят непустые снимки —
+    что-то в ней меняется, значит рамка вообще на что-то смотрит), но дольше
+    ``warning_after`` секунд из неё не вышло ни одной распознанной фразы —
+    это подозрительно, и стоит предупредить. Если снимков не приходит совсем
+    (рамка указывает в совершенно статичное место — рабочий стол, чёрный
+    экран) — предупреждение выдаётся по тому же таймеру: реальная субтитровая
+    область почти наверняка за полторы минуты активной игры даст хотя бы одну
+    реплику, а полное молчание настолько же подозрительно, насколько и «видим
+    картинку, но текста в ней нет».
+
+    Чтобы не спамить одним и тем же предупреждением: после срабатывания для
+    области оно не повторяется, пока не появится новая распознанная фраза —
+    именно она и означает, что всё в порядке и таймер можно снова обнулить.
+    Так «тихая сцена» (в игре давно никто не говорит, но рамка настроена
+    верно) даёт одно спокойное напоминание раз в ``warning_after`` секунд, а
+    не поток сообщений на каждом цикле.
+    """
+
+    def __init__(self, warning_after: float = config.NO_SPEECH_WARNING_SECONDS) -> None:
+        self._warning_after = warning_after
+        self._last_speech_at: Dict[int, float] = {}
+        self._warned: Dict[int, bool] = {}
+
+    def reset(self, area: int, now: float) -> None:
+        """Отмечает начало слежения за областью (или её появление заново)."""
+        self._last_speech_at[area] = now
+        self._warned[area] = False
+
+    def on_phrase_recognized(self, area: int, now: float) -> None:
+        """Фраза распознана — область точно наведена верно, таймер обнуляется."""
+        self._last_speech_at[area] = now
+        self._warned[area] = False
+
+    def check(self, area: int, now: float) -> Optional[str]:
+        """
+        Возвращает текст предупреждения, если для области пора его выдать,
+        иначе None. Одно и то же предупреждение не повторяется, пока не
+        появится новая распознанная фраза (см. on_phrase_recognized).
+        """
+        last = self._last_speech_at.get(area)
+        if last is None:
+            self.reset(area, now)
+            return None
+        if self._warned.get(area):
+            return None
+        if now - last < self._warning_after:
+            return None
+        self._warned[area] = True
+        seconds = int(self._warning_after)
+        return (
+            f"Область {area + 1}: субтитры не обнаруживаются {seconds} секунд — "
+            f"проверьте, что рамка наведена на игру."
+        )
+
+    def forget_missing(self, active_areas: range) -> None:
+        """Убирает состояние удалённых областей (число рамок могло уменьшиться)."""
+        for area in list(self._last_speech_at):
+            if area not in active_areas:
+                del self._last_speech_at[area]
+                self._warned.pop(area, None)
+
+
 # ---------------------------------------------------------------------------
 # Поток распознавания
 # ---------------------------------------------------------------------------
@@ -327,10 +395,15 @@ class OcrWorker(_LoopWorker):
         speech_queue: "queue.Queue[SpeechItem]",
         stop_event: threading.Event,
         ocr: BaseOcr,
+        no_speech_warning_seconds: float = config.NO_SPEECH_WARNING_SECONDS,
     ) -> None:
         super().__init__("OcrWorker", bus, stop_event)
         self._shared = shared
         self._buffer = buffer
+        # Вынесено в параметр (а не жёстко config.NO_SPEECH_WARNING_SECONDS внутри
+        # run()) главным образом ради тестируемости: тест диагностики может
+        # передать короткий порог вместо того, чтобы ждать минуты полторы.
+        self._no_speech_warning_seconds = no_speech_warning_seconds
         self._speech_queue = speech_queue
         self._ocr = ocr
 
@@ -339,6 +412,7 @@ class OcrWorker(_LoopWorker):
         area_count = 0
         consecutive_errors = 0
         last_purge = time.monotonic()
+        health = _AreaHealthMonitor(self._no_speech_warning_seconds)
         logger.info("Поток распознавания запущен.")
 
         try:
@@ -350,14 +424,26 @@ class OcrWorker(_LoopWorker):
                 if now - last_purge >= 1.0:
                     self._buffer.purge()
                     last_purge = now
-                if frame is None:
-                    continue
 
                 settings = self._shared.snapshot()
                 if len(settings.rois) != area_count:
                     # Области добавили или убрали: нумерация могла сдвинуться — фильтры начинаем заново.
                     filters.clear()
                     area_count = len(settings.rois)
+                    health.forget_missing(range(area_count))
+                    for area in range(area_count):
+                        health.reset(area, now)
+
+                # Диагностика проверяется на каждом цикле, а не только когда пришёл
+                # снимок: область, откуда вообще ничего не приходит (рамка смотрит
+                # в совершенно статичное место), тоже должна быть замечена.
+                for area in range(area_count):
+                    warning = health.check(area, now)
+                    if warning:
+                        self._bus.emit("error", warning)
+
+                if frame is None:
+                    continue
                 if frame.area >= area_count:
                     continue  # область уже удалена
 
@@ -390,6 +476,7 @@ class OcrWorker(_LoopWorker):
 
                 phrase = subtitle_filter.process(raw_text, settled=frame.settled)
                 if phrase:
+                    health.on_phrase_recognized(frame.area, now)
                     label = f"[{frame.area + 1}] " if area_count > 1 else ""
                     self._bus.emit("recognized", f"{label}{phrase}")
                     put_dropping_oldest(

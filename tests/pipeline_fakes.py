@@ -148,9 +148,10 @@ def run_pipeline(
     capture_fps: float = 15.0,
     play_seconds: float = 0.15,
     expected: Optional[int] = None,
+    no_speech_warning_seconds: Optional[float] = None,
 ):
     """
-    Запускает настоящие потоки на подделках и возвращает (плеер, OCR, буфер).
+    Запускает настоящие потоки на подделках и возвращает (плеер, OCR, буфер, шина событий).
 
     Работает до истечения ``duration`` секунд или (если задан ``expected``) до тех пор,
     пока не прозвучит столько реплик и не пройдёт ещё немного времени — чтобы поймать
@@ -174,10 +175,14 @@ def run_pipeline(
     tts = FakeTts()
     player = FakePlayer(tts, play_seconds)
 
+    ocr_worker_kwargs = {}
+    if no_speech_warning_seconds is not None:
+        ocr_worker_kwargs["no_speech_warning_seconds"] = no_speech_warning_seconds
+
     started = time.monotonic()
     threads = [
         CaptureWorker(shared, bus, buffer, stop, capture_factory=lambda: FakeScreen(rois, timeline, started)),
-        OcrWorker(shared, bus, buffer, speech_queue, stop, ocr),
+        OcrWorker(shared, bus, buffer, speech_queue, stop, ocr, **ocr_worker_kwargs),
         TtsPlaybackWorker(shared, bus, speech_queue, stop, tts, player),
     ]
     for thread in threads:
@@ -195,4 +200,4 @@ def run_pipeline(
     stop.set()
     for thread in threads:
         thread.join(timeout=5.0)
-    return player, ocr, buffer
+    return player, ocr, buffer, bus

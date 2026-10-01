@@ -14,8 +14,9 @@ import re
 import tempfile
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 
@@ -208,6 +209,80 @@ def change_speed(audio: np.ndarray, speed: float) -> np.ndarray:
     return np.interp(new_positions, old_positions, audio).astype(np.float32)
 
 
+def _cache_key(text: str, speaker: str, speed: float) -> Tuple[str, str, float]:
+    """
+    Ключ кэша синтеза.
+
+    ``speed`` округляется до сотых: слайдер скорости в интерфейсе меняется
+    дискретными шагами, а число с плавающей точкой из настроек (после чтения
+    из JSON, копирования и т. п.) может отличаться на неразличимую на слух
+    долю — без округления это давало бы «непопадание» в кэш там, где по
+    смыслу должно быть попадание.
+    """
+    return (text, speaker, round(speed, 2))
+
+
+class _SynthesisCache:
+    """
+    LRU-кэш готового аудио синтеза речи.
+
+    Ограничение — не число запомненных фраз, а суммарная ДЛИТЕЛЬНОСТЬ
+    аудио в кэше (в секундах, см. config.TTS_CACHE_MAX_SECONDS): реплики
+    сильно различаются по длине, и лимит «столько-то штук» плохо предсказывает
+    реальное потребление памяти. Вытесняются наименее давно запрошенные записи.
+
+    Класс не знает про текст, голос и модель — только про пары «ключ, список
+    аудиофрагментов» и объём, который они занимают. Реализован отдельно от
+    SileroTts, чтобы логику вытеснения можно было проверить в тестах без
+    какой-либо модели.
+    """
+
+    def __init__(self, sample_rate: int, max_seconds: float = config.TTS_CACHE_MAX_SECONDS) -> None:
+        self._sample_rate = max(1, sample_rate)
+        self._max_samples = max(0, int(max_seconds * self._sample_rate))
+        self._entries: "OrderedDict[tuple, List[np.ndarray]]" = OrderedDict()
+        self._total_samples = 0
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def get(self, key: tuple) -> Optional[List[np.ndarray]]:
+        """Возвращает копию закэшированных фрагментов или None, если их нет."""
+        fragments = self._entries.get(key)
+        if fragments is None:
+            return None
+        # Запрошенную запись отмечаем как «свежую» (LRU).
+        self._entries.move_to_end(key)
+        # Копии, а не ссылки на закэшированные массивы: воспроизведение не должно
+        # иметь возможности случайно изменить данные, отданные при следующем запросе.
+        return [fragment.copy() for fragment in fragments]
+
+    def put(self, key: tuple, fragments: List[np.ndarray]) -> None:
+        """Запоминает фрагменты, вытесняя наименее давно запрошенные при нехватке места."""
+        if not fragments or self._max_samples == 0:
+            return
+        size = sum(fragment.size for fragment in fragments)
+        # Одна фраза длиннее всего лимита кэша целиком — например, очень длинный
+        # текст. Хранить её всё равно бессмысленно: она одна вытеснит всё
+        # остальное, а повторно запрошена (весь текст целиком, слово в слово)
+        # будет, скорее всего, нескоро.
+        if size > self._max_samples:
+            return
+        if key in self._entries:
+            self._total_samples -= sum(f.size for f in self._entries[key])
+            del self._entries[key]
+        while self._entries and self._total_samples + size > self._max_samples:
+            _, evicted = self._entries.popitem(last=False)  # last=False — самая старая запись
+            self._total_samples -= sum(f.size for f in evicted)
+        self._entries[key] = [fragment.copy() for fragment in fragments]
+        self._total_samples += size
+
+    def clear(self) -> None:
+        """Полностью очищает кэш (например, при смене модели озвучки)."""
+        self._entries.clear()
+        self._total_samples = 0
+
+
 class SileroTts:
     """Обёртка над моделью Silero: загрузка и превращение текста в звук."""
 
@@ -218,6 +293,12 @@ class SileroTts:
         self._torch = None
         self._optional_kwargs: tuple = _OPTIONAL_TTS_KWARGS
         self._dictionary = StressDictionary()
+        self._cache = _SynthesisCache(self.sample_rate)
+        # Имя модели, для которой сейчас актуален кэш. Отдельно от model_name:
+        # смена self.model_name без повторной загрузки не должна сама по себе
+        # опустошать кэш — тот остаётся верным для уже загруженной модели, пока
+        # не загружена другая.
+        self._cache_model_name: Optional[str] = None
 
     @property
     def is_loaded(self) -> bool:
@@ -260,6 +341,13 @@ class SileroTts:
 
         self._model = model
         self._optional_kwargs = detect_optional_kwargs(model)
+        # Кэш хранит аудио конкретной модели: та же фраза, синтезированная
+        # другой моделью, звучит по-другому, и отдавать старую запись из кэша
+        # было бы неверно. Сбрасываем, только если модель действительно сменилась
+        # (а не при повторной загрузке той же самой — тогда кэш остаётся полезен).
+        if self._cache_model_name != self.model_name:
+            self._cache.clear()
+            self._cache_model_name = self.model_name
         logger.info("Модель озвучки %s загружена (CPU).", self.model_name)
 
     def available_speakers(self) -> List[str]:
@@ -317,6 +405,14 @@ class SileroTts:
         if speaker not in self.available_speakers():
             speaker = config.DEFAULT_SPEAKER
 
+        # Результат синтеза детерминирован при одинаковых (итоговый текст,
+        # голос, скорость) — повторная фраза (боевой выкрик, частая подсказка)
+        # возвращается из кэша без обращения к модели.
+        key = _cache_key(prepared, speaker, speed)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+
         fragments: List[np.ndarray] = []
         for chunk in split_into_chunks(prepared):
             try:
@@ -327,4 +423,6 @@ class SileroTts:
 
             samples = audio.detach().cpu().numpy().astype(np.float32)
             fragments.append(change_speed(samples, speed))
+
+        self._cache.put(key, fragments)
         return fragments
