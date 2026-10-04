@@ -12,6 +12,7 @@ Windows-раннере CI рабочий стол доступен и тесты
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -162,3 +163,55 @@ class RecognitionPreviewButtonTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(_DISPLAY_AVAILABLE, "нет графического дисплея — тест окна пропущен")
+class StartupErrorAndHeaderTests(unittest.TestCase):
+    """
+    Ошибка запуска: причина видна пользователю (диалог и журнал), статус не сменяется
+    на «Остановлено». Подзаголовок шапки не сжимается сеткой и не обрезается.
+    """
+
+    def setUp(self):
+        self.win = gui.MainWindow()
+        self.win.update()
+
+    def tearDown(self):
+        try:
+            for after_id in self.win.tk.eval("after info").split():
+                self.win.after_cancel(after_id)
+        except tkinter.TclError:
+            pass
+        try:
+            for overlay in self.win.overlays:
+                overlay.destroy()
+            self.win.destroy()
+        except tkinter.TclError:
+            pass
+
+    def test_startup_error_shows_dialog_and_keeps_error_status(self):
+        from workers import UiEvent
+        self.win._starting = True
+        with mock.patch.object(gui.messagebox, "showerror") as dialog:
+            self.win._handle_event(UiEvent(kind="error", text="Не удалось скачать модель озвучки"))
+            # Движок сразу после ошибки шлёт «stopped» — статус ошибки не должен быть перезаписан.
+            self.win._handle_event(UiEvent(kind="stopped", text="Остановлено."))
+        self.win.update()
+        dialog.assert_called_once()
+        self.assertEqual(self.win.status_label.cget("text"), "Ошибка запуска")
+        self.assertEqual(self.win.start_button.cget("text"), "▶  Запустить")
+        self.assertFalse(self.win._starting)
+
+    def test_runtime_error_does_not_show_dialog(self):
+        from workers import UiEvent
+        self.win._starting = False
+        with mock.patch.object(gui.messagebox, "showerror") as dialog:
+            self.win._handle_event(UiEvent(kind="error", text="Ошибка воспроизведения звука"))
+        dialog.assert_not_called()
+        self.assertEqual(self.win.status_label.cget("text"), "Ошибка")
+
+    def test_header_subtitle_is_not_squeezed_at_minimum_width(self):
+        self.win.geometry("580x780")
+        self.win.update()
+        label = self.win.subtitle_label
+        self.assertLessEqual(label.winfo_reqwidth(), label.winfo_width())

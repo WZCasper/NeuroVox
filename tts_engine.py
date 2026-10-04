@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from collections import OrderedDict
@@ -76,12 +77,65 @@ def is_model_downloaded(model_name: str) -> bool:
     return path.is_file() and path.stat().st_size >= config.MIN_MODEL_SIZE_BYTES
 
 
+def _is_retryable(exc: BaseException) -> bool:
+    """Стоит ли повторять попытку: сетевые сбои и ответы 5xx, 408, 429 — да; отказ 4xx — нет."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code >= 500 or exc.code in (408, 429)
+    return True
+
+
+def _describe_network_error(exc: BaseException) -> str:
+    """Короткое понятное описание сетевой ошибки для журнала и окна программы."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"сервер ответил HTTP {exc.code}"
+    reason = getattr(exc, "reason", None)
+    text = str(reason) if reason is not None else str(exc)
+    return text or exc.__class__.__name__
+
+
+def _fetch_to_file(url: str, tmp_path: Path, notify: ProgressCallback) -> None:
+    """
+    Скачивает url в tmp_path одной попыткой.
+
+    Сверяет число полученных байт с Content-Length: если соединение оборвалось,
+    read() тихо возвращает пустую строку, и без проверки обрезанный файл был бы
+    принят за готовую модель.
+    """
+    request = urllib.request.Request(url, headers={"User-Agent": f"{config.APP_NAME}/{config.APP_VERSION}"})
+    with urllib.request.urlopen(request, timeout=config.MODEL_DOWNLOAD_TIMEOUT_S) as response, open(
+        tmp_path, "wb"
+    ) as out:
+        total = int(response.headers.get("Content-Length") or 0)
+        downloaded = 0
+        last_reported = -1
+        while True:
+            block = response.read(1024 * 256)
+            if not block:
+                break
+            out.write(block)
+            downloaded += len(block)
+            if total:
+                percent = int(downloaded * 100 / total)
+                if percent != last_reported:
+                    last_reported = percent
+                    notify(
+                        downloaded / total,
+                        f"Скачивание модели: {percent}% "
+                        f"({downloaded // (1024 * 1024)} из {total // (1024 * 1024)} МБ)",
+                    )
+
+    if total and downloaded != total:
+        raise OSError(f"соединение прервано: получено {downloaded} из {total} байт")
+
+
 def download_model(model_name: str, progress: Optional[ProgressCallback] = None) -> Path:
     """
     Скачивает модель Silero, если её ещё нет на диске.
 
-    Запись идёт во временный файл, который переименовывается только после
-    полной загрузки — обрыв связи не оставит «битую» модель.
+    Запись идёт во временный файл, который переименовывается только после полной
+    загрузки, — обрыв связи не оставит «битую» модель. Временные сетевые сбои
+    повторяются с паузой: рукопожатие TLS на некоторых сетях срывается, а следующая
+    попытка проходит.
     """
     notify = progress or (lambda _p, _m: None)
 
@@ -102,57 +156,53 @@ def download_model(model_name: str, progress: Optional[ProgressCallback] = None)
     url = config.SILERO_MODELS[model_name]
     try:
         config.MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        tmp_fd, tmp_name = tempfile.mkstemp(suffix=".part", dir=str(config.MODELS_DIR))
     except OSError as exc:
-        raise TtsError(f"Не удалось создать папку для моделей ({config.MODELS_DIR}): {exc}") from exc
+        raise TtsError(f"Не удалось подготовить папку для моделей ({config.MODELS_DIR}): {exc}") from exc
+    os.close(tmp_fd)
+    tmp_path = Path(tmp_name)
 
     logger.info("Скачивание модели озвучки %s ...", model_name)
     notify(0.0, f"Скачивание модели озвучки «{model_name}»...")
 
-    tmp_fd, tmp_name = tempfile.mkstemp(suffix=".part", dir=str(config.MODELS_DIR))
-    os.close(tmp_fd)
-    tmp_path = Path(tmp_name)
-
+    attempts = max(1, config.MODEL_DOWNLOAD_ATTEMPTS)
+    last_error: Optional[BaseException] = None
     try:
-        request = urllib.request.Request(url, headers={"User-Agent": f"{config.APP_NAME}/{config.APP_VERSION}"})
-        with urllib.request.urlopen(request, timeout=30) as response, open(tmp_path, "wb") as out:
-            total = int(response.headers.get("Content-Length") or 0)
-            downloaded = 0
-            last_reported = -1
-            while True:
-                block = response.read(1024 * 256)
-                if not block:
+        for attempt in range(1, attempts + 1):
+            try:
+                _fetch_to_file(url, tmp_path, notify)
+                size = tmp_path.stat().st_size
+                if size < config.MIN_MODEL_SIZE_BYTES:
+                    raise OSError(f"скачанный файл слишком мал ({size} байт): сервер вернул не модель")
+                os.replace(tmp_path, target)
+                last_error = None
+                break
+            except (OSError, ValueError) as exc:
+                # urllib.error.URLError, socket.timeout, ssl.SSLError и обрыв соединения — всё это
+                # OSError; ValueError возникает при некорректном заголовке Content-Length.
+                last_error = exc
+                logger.warning(
+                    "Попытка %d из %d скачать модель не удалась: %s",
+                    attempt, attempts, _describe_network_error(exc),
+                )
+                if attempt == attempts or not _is_retryable(exc):
                     break
-                out.write(block)
-                downloaded += len(block)
-                if total:
-                    percent = int(downloaded * 100 / total)
-                    if percent != last_reported:
-                        last_reported = percent
-                        notify(
-                            downloaded / total,
-                            f"Скачивание модели: {percent}% "
-                            f"({downloaded // (1024 * 1024)} из {total // (1024 * 1024)} МБ)",
-                        )
-
-        size = tmp_path.stat().st_size
-        if size < config.MIN_MODEL_SIZE_BYTES:
-            raise TtsError(
-                f"Скачанный файл слишком мал ({size} байт) — загрузка прервана или сервер вернул ошибку."
-            )
-        os.replace(tmp_path, target)
-    except urllib.error.URLError as exc:
-        raise TtsError(
-            "Не удалось скачать модель озвучки. Проверьте подключение к интернету "
-            f"(нужно только при первом запуске). Подробности: {exc.reason}"
-        ) from exc
-    except (OSError, TimeoutError) as exc:
-        raise TtsError(f"Ошибка при скачивании модели: {exc}") from exc
+                notify(0.0, f"Связь прервалась, повторная попытка {attempt + 1} из {attempts}...")
+                time.sleep(config.MODEL_DOWNLOAD_RETRY_DELAY_S)
     finally:
         if tmp_path.exists():
             try:
                 tmp_path.unlink()
             except OSError:
                 pass
+
+    if last_error is not None:
+        raise TtsError(
+            "Не удалось скачать модель озвучки. Проверьте интернет и антивирус (некоторые программы "
+            "блокируют загрузку моделей). Модель можно скачать вручную: откройте в браузере "
+            f"{url}, сохраните файл как {target} и запустите программу снова. "
+            f"Подробности: {_describe_network_error(last_error)}"
+        ) from last_error
 
     logger.info("Модель озвучки скачана: %s", target)
     notify(1.0, "Модель озвучки готова.")

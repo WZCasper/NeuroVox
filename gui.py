@@ -73,6 +73,11 @@ def find_free_slot(existing, screen_width: int, screen_height: int):
     )
 
 
+# Ширина переноса подзаголовка в шапке (px): с запасом помещается в столбец слева от статуса
+# даже при минимальной ширине окна (580 px).
+HEADER_SUBTITLE_WRAP_PX = 320
+
+
 class MainWindow(ctk.CTk):
     """Главное окно управления программой."""
 
@@ -97,6 +102,7 @@ class MainWindow(ctk.CTk):
         self._engine_by_label: Dict[str, str] = {label: key for key, label in OCR_LABELS.items()}
         self._model_by_label: Dict[str, str] = {label: key for key, label in MODEL_LABELS.items()}
         self._starting = False
+        self._startup_failed = False
 
         self._build_ui()
         self._create_overlays()
@@ -124,11 +130,17 @@ class MainWindow(ctk.CTk):
         ctk.CTkLabel(header, text="NeuroVox", font=ctk.CTkFont(size=26, weight="bold")).grid(
             row=0, column=0, padx=16, pady=(12, 0), sticky="w"
         )
-        ctk.CTkLabel(
+        # Подзаголовок переносится по словам: в узком окне (580 px) столбец слева от статуса
+        # около 330 px шириной. Без переноса текст шире столбца, и сетка обрезает его с обеих сторон.
+        self.subtitle_label = ctk.CTkLabel(
             header,
             text="Озвучка игровых субтитров в реальном времени — полностью офлайн",
             text_color=COLOR_IDLE,
-        ).grid(row=1, column=0, padx=16, pady=(0, 12), sticky="w")
+            justify="left",
+            anchor="w",
+            wraplength=HEADER_SUBTITLE_WRAP_PX,
+        )
+        self.subtitle_label.grid(row=1, column=0, padx=16, pady=(0, 12), sticky="w")
 
         self.status_dot = ctk.CTkLabel(header, text="●", font=ctk.CTkFont(size=22), text_color=COLOR_IDLE)
         self.status_dot.grid(row=0, column=1, rowspan=2, padx=(0, 6))
@@ -383,6 +395,7 @@ class MainWindow(ctk.CTk):
         # Сохраняем актуальные области на случай, если пользователь двигал рамки.
         self._sync_rois()
         self._starting = True
+        self._startup_failed = False
         self.settings.save()
         self._set_status("Подготовка...", COLOR_LOADING)
         self.start_button.configure(text="■  Остановить", fg_color="#c0392b", hover_color="#992d22")
@@ -538,16 +551,29 @@ class MainWindow(ctk.CTk):
         elif event.kind == "spoken":
             self._log(f"🔊 озвучено за {event.value:.2f} с")
         elif event.kind == "error":
-            self._set_status("Ошибка", COLOR_ERROR)
-            self._log(f"⚠ {event.text}")
+            if self._starting:
+                # Ошибка при запуске: движок останавливается сам. Причина должна быть видна сразу,
+                # а статус не должен сменяться на «Остановлено».
+                self._startup_failed = True
+                self._set_status("Ошибка запуска", COLOR_ERROR)
+                self._log(f"⚠ {event.text}")
+                messagebox.showerror("NeuroVox — не удалось запустить", event.text, parent=self)
+            else:
+                self._set_status("Ошибка", COLOR_ERROR)
+                self._log(f"⚠ {event.text}")
         elif event.kind == "stopped":
             self._starting = False
             self._hide_progress()
-            self._set_status("Остановлено", COLOR_IDLE)
+            if self._startup_failed:
+                self._startup_failed = False
+                self._set_status("Ошибка запуска", COLOR_ERROR)
+                self._log("Запуск не выполнен. Исправьте причину и нажмите «Запустить» снова.")
+            else:
+                self._set_status("Остановлено", COLOR_IDLE)
+                self._log(event.text)
             self.start_button.configure(
                 text="▶  Запустить", fg_color="#1f9d55", hover_color="#187a43", state="normal",
             )
-            self._log(event.text)
 
     # ------------------------------------------------------------------
     # Вспомогательное
