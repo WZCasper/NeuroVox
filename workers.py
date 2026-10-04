@@ -35,7 +35,7 @@ import config
 from capture import AreaTracker, CaptureError, ScreenCapture, preprocess_for_ocr
 from frame_buffer import FrameBuffer
 from ocr_engine import BaseOcr, OcrError, create_with_fallback
-from text_filter import SubtitleFilter
+from text_filter import SubtitleFilter, clean_text
 from tts_engine import SileroTts, TtsError
 
 logger = logging.getLogger("neurovox.workers")
@@ -581,7 +581,12 @@ class NeuroVoxEngine:
     потоке, поэтому окно остаётся отзывчивым.
     """
 
-    def __init__(self, shared: SharedSettings, bus: EventBus) -> None:
+    def __init__(
+        self,
+        shared: SharedSettings,
+        bus: EventBus,
+        capture_factory: Callable[[], ScreenCapture] = ScreenCapture,
+    ) -> None:
         self._shared = shared
         self._bus = bus
         self._stop_event = threading.Event()
@@ -595,10 +600,30 @@ class NeuroVoxEngine:
         self._player = AudioPlayer()
         self._lock = threading.Lock()
         self._running = False
+        # Та же фабрика, что получает CaptureWorker — по умолчанию настоящий
+        # экран, в тестах подменяется поддельным источником кадров (см.
+        # preview_recognition, единственное место, где NeuroVoxEngine сам
+        # создаёт ScreenCapture — CaptureWorker строит собственный).
+        self._capture_factory = capture_factory
 
     @property
     def is_running(self) -> bool:
         return self._running
+
+    def available_speakers(self) -> List[str]:
+        """
+        Голоса, реально доступные в данный момент для озвучки.
+
+        Пока модель ещё не загружена (программа не запускалась, или была
+        запущена с другой моделью), возвращает статичный список-заглушку —
+        тот же, что вернула бы SileroTts.available_speakers() без модели.
+        Безопасен для вызова из потока интерфейса: ничего не загружает и не
+        блокирует, только читает уже загруженную (или ещё не загруженную)
+        модель — актуальный список появляется после события "ready".
+        """
+        if self._tts is None:
+            return list(config.SILERO_SPEAKERS)
+        return self._tts.available_speakers()
 
     # -- запуск --------------------------------------------------------------
 
@@ -706,3 +731,79 @@ class NeuroVoxEngine:
                 self._bus.emit("error", f"Ошибка проверки голоса: {exc}")
 
         threading.Thread(target=task, name="VoicePreview", daemon=True).start()
+
+    def preview_recognition(self) -> None:
+        """
+        Делает один снимок каждой настроенной области, распознаёт текст через
+        текущий выбранный OCR-движок и выводит в журнал и сырой, и очищенный
+        (text_filter.clean_text) результат — без обращения к TTS и плееру.
+
+        Нужна, чтобы проверить, что рамка действительно наведена на субтитры
+        и OCR их читает, не дожидаясь полноценного запуска слежения и не
+        слушая озвучку: достаточно посмотреть в журнал программы.
+
+        Движок OCR грузится лениво при первом использовании (как и TTS в
+        preview_voice) — если ещё не загружен, пользователь увидит статус
+        загрузки и результат появится чуть позже, интерфейс при этом не
+        замирает (вся работа — в отдельном потоке).
+        """
+
+        def task() -> None:
+            settings = self._shared.snapshot()
+            if not settings.rois:
+                self._bus.emit("error", "Нет ни одной настроенной области — нечего проверять.")
+                return
+            try:
+                self._prepare_ocr(settings)
+            except OcrError as exc:
+                self._bus.emit("error", str(exc))
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Ошибка загрузки распознавания при проверке")
+                self._bus.emit("error", f"Ошибка загрузки распознавания: {exc}")
+                return
+
+            try:
+                capture = self._capture_factory()
+            except CaptureError as exc:
+                self._bus.emit("error", str(exc))
+                return
+
+            try:
+                multiple = len(settings.rois) > 1
+                for index, roi in enumerate(settings.rois):
+                    label = f"Область {index + 1}: " if multiple else ""
+                    try:
+                        frame = capture.grab(roi)
+                    except CaptureError as exc:
+                        self._bus.emit("error", f"{label}не удалось сделать снимок: {exc}")
+                        continue
+
+                    image = preprocess_for_ocr(frame)
+                    if image is None:
+                        self._bus.emit(
+                            "status",
+                            f"{label}текст не обнаружен (похожей на текст области в кадре нет).",
+                        )
+                        continue
+
+                    try:
+                        raw_text = self._ocr.recognize(image)
+                    except OcrError as exc:
+                        self._bus.emit("error", f"{label}ошибка распознавания: {exc}")
+                        continue
+
+                    cleaned = clean_text(raw_text)
+                    if not cleaned:
+                        self._bus.emit(
+                            "status",
+                            f"{label}похожая на текст область есть, но распознать ничего не "
+                            f"удалось (сырой ответ движка: {raw_text!r}).",
+                        )
+                        continue
+                    self._bus.emit("status", f"{label}сырой текст: {raw_text!r}")
+                    self._bus.emit("status", f"{label}очищенный текст: {cleaned!r}")
+            finally:
+                capture.close()
+
+        threading.Thread(target=task, name="RecognitionPreview", daemon=True).start()

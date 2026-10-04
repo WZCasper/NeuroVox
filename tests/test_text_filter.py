@@ -66,13 +66,36 @@ class SubtitleFilterTests(unittest.TestCase):
         frames = ["Первая реплика героя"] * 3 + [""] * 2 + ["Совершенно другой ответ"] * 3
         self.assertEqual(len(self._spoken(frames)), 2)
 
-    def test_same_phrase_after_pause_is_spoken_again(self):
-        frames = ["Беги отсюда"] * 3 + [""] * 3 + ["Беги отсюда"] * 3
-        self.assertEqual(self._spoken(frames), ["Беги отсюда", "Беги отсюда"])
+    def test_same_phrase_after_forget_is_spoken_again(self):
+        # Область субтитров опустела (реплика закончилась) — в реальном
+        # конвейере (workers.OcrWorker) об этом сообщает не пустая строка в
+        # process(), а отдельный вызов forget(), когда снимок помечен как
+        # пустой (frame.is_marker). Та же фраза после этого — новое появление.
+        flt = SubtitleFilter(threshold=85, stable_frames=2)
+        frames_before = ["Беги отсюда"] * 3
+        frames_after = ["Беги отсюда"] * 3
+        spoken = [p for p in (flt.process(f) for f in frames_before) if p]
+        flt.forget()
+        spoken += [p for p in (flt.process(f) for f in frames_after) if p]
+        self.assertEqual(spoken, ["Беги отсюда", "Беги отсюда"])
 
-    def test_same_phrase_without_pause_is_not_repeated(self):
-        frames = ["Беги отсюда"] * 3 + [""] * 1 + ["Беги отсюда"] * 3
+    def test_same_phrase_without_forget_is_not_repeated(self):
+        # Без forget() между повторами — это один и тот же, ещё не
+        # закончившийся показ реплики, повторно озвучивать не нужно.
+        frames = ["Беги отсюда"] * 3 + ["Беги отсюда"] * 3
         self.assertEqual(self._spoken(frames), ["Беги отсюда"])
+
+    def test_empty_string_is_safe_and_does_not_forget_last_spoken(self):
+        # process() с пустой строкой больше не пытается распознать «реплика
+        # закончилась» (это больше не происходит в текущем конвейере — см.
+        # docstring process()), но не должен падать и не должен сам по себе
+        # сбрасывать last_spoken — это теперь исключительно работа forget().
+        flt = SubtitleFilter(threshold=85, stable_frames=2)
+        self.assertIsNotNone(flt.process("Беги отсюда", settled=True))
+        for _ in range(10):
+            self.assertIsNone(flt.process(""))
+        # Без forget() та же фраза всё ещё считается тем же показом реплики.
+        self.assertIsNone(flt.process("Беги отсюда", settled=True))
 
 
 class SettledFrameTests(unittest.TestCase):

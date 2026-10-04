@@ -7,11 +7,14 @@
 
 import pathlib
 import sys
+import threading
+import time
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from workers import _AreaHealthMonitor  # noqa: E402
+import config  # noqa: E402
+from workers import EventBus, NeuroVoxEngine, SharedSettings, _AreaHealthMonitor  # noqa: E402
 
 from tests.pipeline_fakes import run_pipeline  # noqa: E402
 
@@ -73,6 +76,281 @@ class AreaHealthMonitorTests(unittest.TestCase):
         # Область 1 «забыта»: следующий check начнёт отсчёт заново, а не выдаст
         # немедленное предупреждение по старому (уже нерелевантному) времени.
         self.assertIsNone(monitor.check(1, now=100.0))
+
+
+def _wait_for_thread(name, timeout=5.0):
+    """Дожидается завершения фонового потока с данным именем (или что он вообще не появлялся)."""
+    deadline = time.monotonic() + timeout
+    # Сначала даём потоку шанс стартовать — NeuroVoxEngine.preview_recognition()
+    # запускает его асинхронно, сразу после вызова его может ещё не быть в списке.
+    thread = None
+    while time.monotonic() < deadline:
+        thread = next((t for t in threading.enumerate() if t.name == name), None)
+        if thread is not None:
+            break
+        time.sleep(0.01)
+    if thread is not None:
+        thread.join(timeout=max(0.1, deadline - time.monotonic()))
+
+
+class _FakeOcr:
+    """
+    Поддельный OCR-движок: тексты заданы по порядку вызовов recognize() —
+    preprocess_for_ocr бинаризует кадр, исходные пиксели-метки в нём не
+    сохраняются, поэтому различать кадры по содержимому ненадёжно; порядок
+    вызовов же детерминирован (preview_recognition идёт по areas последовательно).
+    """
+
+    name = "fake"
+
+    def __init__(self, texts_in_order=(), raise_on_call=frozenset()):
+        self._texts = list(texts_in_order)
+        self._raise_on_call = raise_on_call
+        self.calls = 0
+
+    def load(self):
+        pass
+
+    def recognize(self, image):
+        call_index = self.calls
+        self.calls += 1
+        if call_index in self._raise_on_call:
+            from ocr_engine import OcrError
+            raise OcrError(f"подделанная ошибка распознавания (вызов {call_index})")
+        return self._texts[call_index] if call_index < len(self._texts) else ""
+
+
+class _FakeCapture:
+    """Поддельный источник кадров: по каждому вызову grab(roi) отдаёт следующий кадр по порядку."""
+
+    def __init__(self, frames):
+        self._frames = list(frames)
+        self.closed = False
+        self.grabbed_rois = []
+
+    def __call__(self):
+        return self
+
+    def grab(self, roi):
+        self.grabbed_rois.append(roi)
+        index = len(self.grabbed_rois) - 1
+        return self._frames[index]
+
+    def close(self):
+        self.closed = True
+
+
+def _frame_with_outlined_text(size=(80, 400)):
+    """
+    Синтетический кадр, который preprocess_for_ocr гарантированно распознает
+    как «похоже на текст» — обведённые белые буквы на сером фоне с лёгким
+    градиентом (тот же стиль, что и в test_capture.py).
+    """
+    import cv2
+    import numpy as np
+
+    h, w = size
+    frame = np.zeros((h, w, 3), dtype=np.uint8)
+    for x in range(w):
+        value = int(40 + (x / w) * 120)
+        frame[:, x] = (value, value, value)
+    cv2.putText(frame, "TEXT", (20, h // 2 + 10), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 6, cv2.LINE_AA)
+    cv2.putText(frame, "TEXT", (20, h // 2 + 10), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2, cv2.LINE_AA)
+    return frame
+
+
+def _blank_frame(size=(80, 400)):
+    """Совершенно пустой (однотонный) кадр — preprocess_for_ocr должен вернуть None."""
+    import numpy as np
+    return np.full((size[0], size[1], 3), 60, dtype=np.uint8)
+
+
+class _FakeSileroTts:
+    """Минимальная подделка SileroTts для теста NeuroVoxEngine.available_speakers()."""
+
+    def __init__(self, speakers):
+        self._speakers = list(speakers)
+        self.model_name = "fake_model"
+        self.is_loaded = True
+
+    def available_speakers(self):
+        return list(self._speakers)
+
+
+class NeuroVoxEngineSpeakersTests(unittest.TestCase):
+    """
+    available_speakers() должен безопасно работать из потока интерфейса: до
+    загрузки модели — отдавать статичный список-заглушку, после загрузки —
+    список реальных голосов этой конкретной модели (см. tts_engine.SileroTts).
+    """
+
+    def _make_engine(self):
+        shared = SharedSettings(config.Settings())
+        return NeuroVoxEngine(shared, EventBus())
+
+    def test_before_any_model_loaded_returns_config_fallback(self):
+        engine = self._make_engine()
+        self.assertEqual(set(engine.available_speakers()), set(config.SILERO_SPEAKERS))
+
+    def test_after_model_loaded_returns_models_own_speakers(self):
+        engine = self._make_engine()
+        # Подставляем уже «загруженную» модель напрямую — как и в тестах
+        # SileroTts.synthesize(), без реального torch и реальной загрузки.
+        engine._tts = _FakeSileroTts(["aidar", "baya", "kseniya", "xenia", "eugene", "random"])
+        self.assertIn("random", engine.available_speakers())
+        self.assertEqual(
+            set(engine.available_speakers()),
+            {"aidar", "baya", "kseniya", "xenia", "eugene", "random"},
+        )
+
+    def test_does_not_block_or_touch_threads(self):
+        # Чисто функциональная проверка «безопасно вызывать из потока интерфейса»:
+        # метод не создаёт и не трогает никакие потоки сам по себе.
+        engine = self._make_engine()
+        before = threading.active_count()
+        engine.available_speakers()
+        self.assertEqual(threading.active_count(), before)
+
+
+class PreviewRecognitionTests(unittest.TestCase):
+    """
+    NeuroVoxEngine.preview_recognition(): разовая проверка распознавания без
+    обращения к TTS/AudioPlayer — ровно то, что требует кнопка «Проверить
+    распознавание» в интерфейсе.
+    """
+
+    def _make_engine(self, rois, ocr, frames):
+        settings = config.Settings()
+        settings.rois = rois
+        settings.ocr_engine = config.DEFAULT_OCR_ENGINE
+        shared = SharedSettings(settings)
+        engine = NeuroVoxEngine(shared, EventBus(), capture_factory=_FakeCapture(frames))
+        # «Уже загруженный» движок с совпадающим именем — _prepare_ocr не
+        # станет создавать настоящий (а настоящий требует easyocr/tesseract).
+        engine._ocr = ocr
+        engine._ocr_name = config.DEFAULT_OCR_ENGINE
+        return engine
+
+    def test_recognized_text_is_logged_raw_and_cleaned_without_tts(self):
+        ocr = _FakeOcr(texts_in_order=["Привет,   мир!\n"])
+        engine = self._make_engine(
+            rois=[[0, 0, 400, 80]], ocr=ocr, frames=[_frame_with_outlined_text()],
+        )
+        engine.preview_recognition()
+        _wait_for_thread("RecognitionPreview")
+
+        events = engine._bus.poll(limit=50)
+        texts = [e.text for e in events]
+        self.assertTrue(any("сырой текст" in t and "Привет" in t for t in texts), texts)
+        self.assertTrue(any("очищенный текст" in t and "Привет, мир!" in t for t in texts), texts)
+        # Ключевое требование: TTS и плеер не должны были использоваться вообще.
+        self.assertIsNone(engine._tts)
+
+    def test_empty_area_reports_no_text_found(self):
+        # preprocess_for_ocr возвращает None для однотонного кадра — пользователь
+        # должен увидеть явное объяснение, а не тишину в журнале.
+        ocr = _FakeOcr()
+        engine = self._make_engine(rois=[[0, 0, 400, 80]], ocr=ocr, frames=[_blank_frame()])
+        engine.preview_recognition()
+        _wait_for_thread("RecognitionPreview")
+
+        events = engine._bus.poll(limit=50)
+        texts = [e.text for e in events]
+        self.assertTrue(any("текст не обнаружен" in t for t in texts), texts)
+        self.assertEqual(ocr.calls, 0)  # OCR вообще не вызывался — нечего распознавать
+
+    def test_multiple_areas_are_each_labelled(self):
+        ocr = _FakeOcr(texts_in_order=["Первая", "Вторая"])
+        engine = self._make_engine(
+            rois=[[0, 0, 400, 80], [0, 100, 400, 80]],
+            ocr=ocr,
+            frames=[_frame_with_outlined_text(), _frame_with_outlined_text()],
+        )
+        engine.preview_recognition()
+        _wait_for_thread("RecognitionPreview")
+
+        events = engine._bus.poll(limit=50)
+        texts = [e.text for e in events]
+        self.assertTrue(any(t.startswith("Область 1:") for t in texts), texts)
+        self.assertTrue(any(t.startswith("Область 2:") for t in texts), texts)
+
+    def test_single_area_is_not_labelled_with_number(self):
+        # Одна область — подписывать «Область 1:» избыточно, как и у остальной
+        # диагностики в проекте (ср. recognized-метки в OcrWorker.run()).
+        ocr = _FakeOcr(texts_in_order=["Текст"])
+        engine = self._make_engine(
+            rois=[[0, 0, 400, 80]], ocr=ocr, frames=[_frame_with_outlined_text()],
+        )
+        engine.preview_recognition()
+        _wait_for_thread("RecognitionPreview")
+
+        events = engine._bus.poll(limit=50)
+        texts = [e.text for e in events]
+        self.assertFalse(any("Область 1" in t for t in texts), texts)
+
+    def test_ocr_error_on_one_area_does_not_stop_the_others(self):
+        ocr = _FakeOcr(texts_in_order=["", "Вторая область в порядке"], raise_on_call={0})
+        engine = self._make_engine(
+            rois=[[0, 0, 400, 80], [0, 100, 400, 80]],
+            ocr=ocr,
+            frames=[_frame_with_outlined_text(), _frame_with_outlined_text()],
+        )
+        engine.preview_recognition()
+        _wait_for_thread("RecognitionPreview")
+
+        events = engine._bus.poll(limit=50)
+        texts = [e.text for e in events]
+        self.assertTrue(any(e.kind == "error" and "Область 1" in e.text for e in events), texts)
+        self.assertTrue(any("Вторая область в порядке" in t for t in texts), texts)
+
+    def test_capture_is_closed_after_use(self):
+        ocr = _FakeOcr(texts_in_order=["Текст"])
+        capture = _FakeCapture([_frame_with_outlined_text()])
+        settings = config.Settings()
+        settings.rois = [[0, 0, 400, 80]]
+        settings.ocr_engine = config.DEFAULT_OCR_ENGINE
+        shared = SharedSettings(settings)
+        engine = NeuroVoxEngine(shared, EventBus(), capture_factory=capture)
+        engine._ocr = ocr
+        engine._ocr_name = config.DEFAULT_OCR_ENGINE
+
+        engine.preview_recognition()
+        _wait_for_thread("RecognitionPreview")
+        self.assertTrue(capture.closed)
+
+    def test_lazily_loads_ocr_engine_when_not_loaded_yet(self):
+        # Движок ещё ни разу не загружался (engine._ocr is None) — тот же
+        # ленивый путь, что и у preview_voice() для TTS: _prepare_ocr должен
+        # быть вызван и загрузить движок перед распознаванием, а не упасть.
+        from unittest import mock
+
+        ocr = _FakeOcr(texts_in_order=["Загружено и распознано"])
+        settings = config.Settings()
+        settings.rois = [[0, 0, 400, 80]]
+        settings.ocr_engine = config.DEFAULT_OCR_ENGINE
+        shared = SharedSettings(settings)
+        capture = _FakeCapture([_frame_with_outlined_text()])
+        engine = NeuroVoxEngine(shared, EventBus(), capture_factory=capture)
+        self.assertIsNone(engine._ocr)  # движок действительно ещё не загружен
+
+        with mock.patch("workers.create_with_fallback", return_value=ocr) as fake_create:
+            engine.preview_recognition()
+            _wait_for_thread("RecognitionPreview")
+
+        fake_create.assert_called_once()
+        events = engine._bus.poll(limit=50)
+        texts = [e.text for e in events]
+        self.assertTrue(any("Загружено и распознано" in t for t in texts), texts)
+
+    def test_no_areas_configured_reports_error_without_touching_ocr(self):
+        ocr = _FakeOcr()
+        engine = self._make_engine(rois=[], ocr=ocr, frames=[])
+        engine.preview_recognition()
+        _wait_for_thread("RecognitionPreview")
+
+        events = engine._bus.poll(limit=50)
+        self.assertTrue(any(e.kind == "error" for e in events))
+        self.assertEqual(ocr.calls, 0)
 
 
 class OcrWorkerHealthIntegrationTests(unittest.TestCase):

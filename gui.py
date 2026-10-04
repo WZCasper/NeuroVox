@@ -138,13 +138,13 @@ class MainWindow(ctk.CTk):
         # -- кнопки управления ---------------------------------------------
         controls = ctk.CTkFrame(self, corner_radius=12)
         controls.grid(row=1, column=0, padx=16, pady=8, sticky="ew")
-        controls.grid_columnconfigure((0, 1), weight=1)
+        controls.grid_columnconfigure((0, 1, 2), weight=1)
 
         self.start_button = ctk.CTkButton(
             controls, text="▶  Запустить", height=44, font=ctk.CTkFont(size=16, weight="bold"),
             fg_color="#1f9d55", hover_color="#187a43", command=self._toggle,
         )
-        self.start_button.grid(row=0, column=0, columnspan=2, padx=16, pady=(16, 8), sticky="ew")
+        self.start_button.grid(row=0, column=0, columnspan=3, padx=16, pady=(16, 8), sticky="ew")
 
         self.overlay_button = ctk.CTkButton(
             controls, text="Скрыть рамки", command=self._toggle_overlay, fg_color="#3a4358", hover_color="#2d3547",
@@ -155,7 +155,13 @@ class MainWindow(ctk.CTk):
             controls, text="🔊 Проверить голос", command=self._preview_voice,
             fg_color="#3a4358", hover_color="#2d3547",
         )
-        self.test_button.grid(row=1, column=1, padx=(6, 16), pady=(0, 16), sticky="ew")
+        self.test_button.grid(row=1, column=1, padx=6, pady=(0, 16), sticky="ew")
+
+        self.recognition_test_button = ctk.CTkButton(
+            controls, text="👁 Проверить распознавание", command=self._preview_recognition,
+            fg_color="#3a4358", hover_color="#2d3547",
+        )
+        self.recognition_test_button.grid(row=1, column=2, padx=(6, 16), pady=(0, 16), sticky="ew")
 
         self.progress = ctk.CTkProgressBar(controls)
         self.progress.set(0)
@@ -395,6 +401,16 @@ class MainWindow(ctk.CTk):
         self._log("Проверка голоса...")
         self.engine.preview_voice()
 
+    def _preview_recognition(self) -> None:
+        """
+        Разовый снимок настроенных областей через OCR, без синтеза речи —
+        быстрый способ проверить, что рамка наведена на субтитры и OCR их
+        читает, не запуская полноценное слежение и не слушая озвучку.
+        """
+        self._sync_rois()  # на случай, если пользователь только что подвинул рамку
+        self._log("Проверка распознавания...")
+        self.engine.preview_recognition()
+
     def _on_roi_change(self, _roi=None) -> None:
         """Пользователь подвинул или растянул одну из рамок — запоминаем все области."""
         self._sync_rois()
@@ -429,6 +445,42 @@ class MainWindow(ctk.CTk):
         speaker = self._voice_by_label.get(label, config.DEFAULT_SPEAKER)
         self.shared.update(speaker=speaker)
         self.settings.speaker = speaker
+
+    def _voice_label(self, speaker: str) -> str:
+        """Человекочитаемая подпись голоса: из словаря, а для незнакомых — сам идентификатор."""
+        return config.SILERO_SPEAKERS.get(speaker, speaker)
+
+    def _refresh_voice_menu(self) -> None:
+        """
+        Обновляет список голосов в меню по реально загруженной модели.
+
+        До первого успешного запуска (события "ready") меню показывает
+        статичный список-заглушку из config.SILERO_SPEAKERS — он и так уже
+        был в values при создании окна, обновлять нечего. После "ready"
+        self.engine.available_speakers() отражает уже загруженную модель:
+        список может как приобрести голоса сверх словаря (как v4_ru с
+        дополнительным random), так и не содержать каких-то из них.
+        """
+        speakers = self.engine.available_speakers()
+        self._voice_by_label = {self._voice_label(speaker): speaker for speaker in speakers}
+        labels = list(self._voice_by_label)
+        self.voice_menu.configure(values=labels)
+
+        if self.settings.speaker in speakers:
+            return
+
+        # Выбранный голос недоступен в этой модели — именно так же молча
+        # подменяется на DEFAULT_SPEAKER и в SileroTts.synthesize(); здесь
+        # синхронизируем с этим и сам интерфейс, чтобы меню не показывало
+        # голос, который на деле уже не используется.
+        previous_label = self._voice_label(self.settings.speaker)
+        fallback = config.DEFAULT_SPEAKER if config.DEFAULT_SPEAKER in speakers else (
+            speakers[0] if speakers else config.DEFAULT_SPEAKER
+        )
+        self.shared.update(speaker=fallback)
+        self.settings.speaker = fallback
+        self.voice_menu.set(self._voice_label(fallback))
+        self._log(f"Голос «{previous_label}» недоступен в этой модели — выбран «{self._voice_label(fallback)}».")
 
     def _on_speed_change(self, value: float) -> None:
         value = round(float(value), 2)
@@ -479,6 +531,7 @@ class MainWindow(ctk.CTk):
             self._starting = False
             self._hide_progress()
             self._set_status("Работает", COLOR_RUNNING)
+            self._refresh_voice_menu()
             self._log(event.text)
         elif event.kind == "recognized":
             self._log(f"📖 {event.text}")

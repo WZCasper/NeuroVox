@@ -125,7 +125,6 @@ class SubtitleFilter:
         self._last_spoken: str = ""
         self._candidate: str = ""
         self._candidate_count: int = 0
-        self._empty_frames: int = 0
 
     def _is_same_growing_phrase(self, new: str, old: str) -> bool:
         """
@@ -141,7 +140,6 @@ class SubtitleFilter:
         self._last_spoken = ""
         self._candidate = ""
         self._candidate_count = 0
-        self._empty_frames = 0
 
     def forget(self) -> None:
         """
@@ -154,7 +152,16 @@ class SubtitleFilter:
 
     def process(self, raw_text: str, settled: bool = False) -> Optional[str]:
         """
-        Обрабатывает распознанную строку.
+        Обрабатывает распознанную строку с устоявшегося (непустого) снимка.
+
+        О том, что область субтитров опустела — реплика закончилась, —
+        вызывающий код сообщает отдельным вызовом forget(), а не пустой
+        строкой здесь: в текущем конвейере (workers.OcrWorker) распознавание
+        вообще не запускается для пустых снимков, туда приходит только текст,
+        для которого OCR что-то нашёл. process() с пустым raw_text по-прежнему
+        безопасен (сразу вернёт None, не уронит остальную логику), но
+        считать опустевшую область он больше не пытается — за это отвечает
+        forget().
 
         settled=True означает, что снимок уже признан устоявшимся по картинке
         (она не менялась заметное время), поэтому ждать подтверждения текста
@@ -164,20 +171,10 @@ class SubtitleFilter:
         Возвращает очищенный текст, если его нужно озвучить, иначе None.
         """
         text = clean_text(raw_text)
-
-        # Пустой кадр: субтитры исчезли. Сбрасываем кандидата, но помним последнюю
-        # озвученную фразу — если та же фраза вернётся, это уже новое появление.
         if not text:
             self._candidate = ""
             self._candidate_count = 0
-            self._empty_frames += 1
-            # Субтитры пропали на несколько кадров подряд — реплика закончилась.
-            # Забываем её, чтобы такая же фраза при повторном появлении
-            # (например, повторная реплика персонажа) была озвучена снова.
-            if self._empty_frames >= config.PAUSE_FRAMES_TO_FORGET:
-                self._last_spoken = ""
             return None
-        self._empty_frames = 0
 
         # Ждём, пока текст «устоится» (перестанет меняться между кадрами).
         if settled:

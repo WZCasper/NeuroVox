@@ -156,8 +156,11 @@ def check_filter(rep: Report) -> None:
     from text_filter import SubtitleFilter, similarity
 
     flt = SubtitleFilter(threshold=85, stable_frames=2)
-    frames = ["Куда ты пропал?"] * 3 + [""] * 3 + ["Не оборачивайся, они рядом"] * 3
-    spoken = [phrase for phrase in (flt.process(frame) for frame in frames) if phrase]
+    # Между репликами область субтитров опустела — в конвейере (workers.OcrWorker)
+    # об этом сообщает forget() при пустом снимке, а не пустая строка в process().
+    spoken = [p for p in (flt.process(f) for f in ["Куда ты пропал?"] * 3) if p]
+    flt.forget()
+    spoken += [p for p in (flt.process(f) for f in ["Не оборачивайся, они рядом"] * 3) if p]
     expected = ["Куда ты пропал?", "Не оборачивайся, они рядом"]
     if spoken != expected:
         rep.fail(f"фильтр повторов вернул {spoken!r}, ожидалось {expected!r}")

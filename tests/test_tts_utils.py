@@ -143,6 +143,20 @@ class ModelV5:
 class ModelWithKwargs:
     def apply_tts(self, text, speaker, sample_rate, **kwargs):
         self.kwargs = kwargs
+
+
+class ModelWithOwnSpeakers:
+    """
+    Модель со своим списком голосов, частично не совпадающим с config.SILERO_SPEAKERS —
+    как настоящая v4_ru, у которой, помимо пяти «именных» голосов, есть ещё
+    random (случайный голос на каждый вызов), отсутствующий в словаре подписей.
+    """
+
+    def __init__(self, speakers):
+        self.speakers = speakers
+
+    def apply_tts(self, text, speaker, sample_rate, **kwargs):
+        return FakeAudio(_fake_samples())
         return FakeAudio(_fake_samples())
 
 
@@ -186,6 +200,32 @@ class SynthesizeTests(unittest.TestCase):
 
     def test_speakers_without_model_come_from_config(self):
         self.assertEqual(set(tts.SileroTts().available_speakers()), set(config.SILERO_SPEAKERS))
+
+    def test_speakers_with_loaded_model_come_from_model_not_config(self):
+        # Реальная v4_ru, помимо пяти голосов из config.SILERO_SPEAKERS, умеет
+        # ещё random — он должен быть виден, а не отфильтрован как «неизвестный».
+        model = ModelWithOwnSpeakers(["aidar", "baya", "kseniya", "xenia", "eugene", "random"])
+        engine = _engine_with(model)
+        self.assertEqual(
+            set(engine.available_speakers()),
+            {"aidar", "baya", "kseniya", "xenia", "eugene", "random"},
+        )
+        self.assertIn("random", engine.available_speakers())
+
+    def test_speakers_with_loaded_model_missing_some_config_voices(self):
+        # Обратный случай: у загруженной модели голосов МЕНЬШЕ, чем в словаре
+        # подписей (например, более старая/урезанная модель) — список должен
+        # отражать именно то, что реально есть в модели, а не весь словарь.
+        model = ModelWithOwnSpeakers(["aidar", "baya"])
+        engine = _engine_with(model)
+        self.assertEqual(set(engine.available_speakers()), {"aidar", "baya"})
+
+    def test_speakers_model_without_speakers_attribute_falls_back_to_config(self):
+        # У модели нет атрибута speakers вообще (неожиданный формат модели) —
+        # падать не должны, используем статичный список как разумный фолбэк.
+        model = ModelV5()  # не имеет атрибута speakers
+        engine = _engine_with(model)
+        self.assertEqual(set(engine.available_speakers()), set(config.SILERO_SPEAKERS))
 
     def test_detects_supported_optional_arguments(self):
         self.assertEqual(tts.detect_optional_kwargs(ModelWithExtras()), ("put_accent", "put_yo"))

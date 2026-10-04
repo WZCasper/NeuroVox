@@ -351,15 +351,25 @@ class SileroTts:
         logger.info("Модель озвучки %s загружена (CPU).", self.model_name)
 
     def available_speakers(self) -> List[str]:
-        """Список голосов, реально присутствующих в загруженной модели."""
+        """
+        Список голосов, реально присутствующих в загруженной модели.
+
+        Берётся напрямую у модели (model.speakers), а не фильтруется по
+        config.SILERO_SPEAKERS: тот словарь даёт только человекочитаемые
+        подписи для уже известных голосов, а не истину о том, что модель
+        умеет. Например, v4_ru помимо пяти «именных» голосов умеет ещё
+        random (случайный голос на каждый вызов) — его не было бы видно,
+        фильтруй мы список по словарю. Если модель не загружена или не
+        предоставляет атрибут speakers — отдаём статичный список как фолбэк
+        (разумное приближение «что скорее всего будет доступно»).
+        """
         if self._model is None:
             return list(config.SILERO_SPEAKERS)
         try:
-            return [s for s in self._model.speakers if s in config.SILERO_SPEAKERS] or list(
-                config.SILERO_SPEAKERS
-            )
+            speakers = list(self._model.speakers)
         except AttributeError:
             return list(config.SILERO_SPEAKERS)
+        return speakers or list(config.SILERO_SPEAKERS)
 
     def _apply_tts(self, chunk: str, speaker: str):
         """
