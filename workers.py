@@ -12,9 +12,18 @@
 
 Снимки экрана делаются быстро (десятки раз в секунду) и не ждут медленного
 распознавания: устоявшиеся снимки копятся в буфере, а распознавание разбирает их
-строго по очереди. Поэтому ни одна реплика не теряется, даже если субтитр сменился,
-пока читался предыдущий. Реплики из нескольких областей озвучиваются по одной, с паузой
-между областями.
+строго по очереди. Поэтому ни одна реплика не теряется при РАСПОЗНАВАНИИ, даже если
+субтитр сменился, пока читался предыдущий, — каждая попадает в очередь на озвучку.
+Реплики из нескольких областей озвучиваются по одной, с паузой между областями.
+
+Озвучка (синтез речи и воспроизведение) на обычном процессоре без видеокарты занимает
+заметное время — секунды, а не миллисекунды, — и может идти медленнее, чем в игре
+меняются субтитры. Чтобы из-за этого не накапливалось отставание (когда программа
+честно проговаривает ВСЮ очередь, но всё сильнее отстаёт от того, что уже на экране),
+поток озвучки, прежде чем произнести очередную реплику, проверяет: не пришла ли для той
+же области более новая, пока эта ждала своей очереди (см. skip_stale_duplicates). Если
+да — устаревшие пропускаются, и озвучивается самая свежая: так голос всегда звучит
+вровень с текущими субтитрами, а не читает историю диалога с нарастающей задержкой.
 
 Потоки общаются через thread-safe очереди и события. Любые сообщения для
 интерфейса отправляются в очередь событий, а GUI сам забирает их в своём
@@ -27,7 +36,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -49,7 +58,9 @@ logger = logging.getLogger("neurovox.workers")
 class UiEvent:
     """Сообщение из рабочего потока в интерфейс."""
 
-    kind: str          # "status" | "recognized" | "spoken" | "error" | "progress" | "ready" | "stopped"
+    # "status" | "recognized" | "spoken" | "error" | "progress" | "ready" | "stopped" |
+    # "speaking_start" | "speaking_end" (value — номер области) | "skipped"
+    kind: str
     text: str = ""
     value: float = 0.0
 
@@ -198,6 +209,51 @@ def put_dropping_oldest(speech_queue: "queue.Queue[SpeechItem]", item: SpeechIte
                 logger.info("Очередь озвучки переполнена, пропущена фраза: %s", dropped.text)
             except queue.Empty:
                 pass
+
+
+def skip_stale_duplicates(
+    speech_queue: "queue.Queue[SpeechItem]", item: SpeechItem
+) -> "Tuple[SpeechItem, int]":
+    """
+    Если, пока ``item`` ждала своей очереди, для ТОЙ ЖЕ области уже пришла более
+    новая реплика — пропускает устаревшую и сразу переходит к самой свежей.
+
+    Зачем это нужно. Синтез и воспроизведение одной фразы на реальном железе (без
+    видеокарты) занимает секунды, а субтитры в диалоге могут меняться чаще. Без этой
+    функции очередь просто растёт, и спустя минуту диалога озвучка начинает заметно
+    отставать от того, что уже давно на экране — читает всё подряд, но с нарастающей
+    задержкой. Раз докладчик физически не может говорить быстрее, чем на самом деле
+    уходит время на синтез и произнесение фразы, единственный способ не отставать —
+    не пытаться озвучить КАЖДУЮ реплику из backlog'а, а при появлении более новой для
+    той же области сразу переходить к ней: так озвучка всегда звучит вровень с
+    текущими субтитрами, а не с теми, что были полминуты назад.
+
+    Реплики ДРУГИХ областей, оказавшиеся в очереди впереди неё, не теряются — они
+    возвращаются в очередь в прежнем порядке и дожидаются своей очереди как обычно;
+    пропускаются только устаревшие реплики ТОЙ ЖЕ области, что и ``item``.
+
+    Возвращает (реплику, которую нужно озвучить, число пропущенных устаревших реплик
+    той же области — 0, если ``item`` и так самая свежая).
+    """
+    deferred: List[SpeechItem] = []
+    skipped = 0
+    latest = item
+    while True:
+        try:
+            candidate = speech_queue.get_nowait()
+        except queue.Empty:
+            break
+        if candidate.area == latest.area:
+            skipped += 1
+            latest = candidate
+        else:
+            deferred.append(candidate)
+    # Возвращаем на место реплики других областей — в том же порядке, в котором
+    # их забрали, так что относительный порядок между ними не меняется. Очередь
+    # переполниться не может: мы вернём не больше элементов, чем только что забрали.
+    for pending in deferred:
+        put_dropping_oldest(speech_queue, pending)
+    return latest, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +584,19 @@ class TtsPlaybackWorker(threading.Thread):
                 except queue.Empty:
                     continue
 
+                # Пока эта реплика ждала своей очереди, для её области могла прийти
+                # более новая — тогда сразу переходим к ней (см. skip_stale_duplicates).
+                item, skipped = skip_stale_duplicates(self._speech_queue, item)
+                if skipped:
+                    area_count = len(self._shared.snapshot().rois)
+                    label = f"Область {item.area + 1}: " if area_count > 1 else ""
+                    message = (
+                        f"{label}пропущено устаревших реплик: {skipped} — "
+                        f"озвучиваем актуальную: {item.text}"
+                    )
+                    logger.info(message)
+                    self._bus.emit("skipped", message)
+
                 # Реплика, простоявшая в очереди слишком долго, в игре уже неактуальна.
                 if time.monotonic() - item.created_at > config.MAX_PHRASE_AGE_SECONDS:
                     logger.info("Реплика устарела и пропущена: %s", item.text)
@@ -555,10 +624,19 @@ class TtsPlaybackWorker(threading.Thread):
                 return
             self._bus.emit("spoken", item.text, time.perf_counter() - started)
             self._wait_turn(item.area, settings.area_pause)
-            for fragment in fragments:
-                if self._stop_event.is_set():
-                    return
-                self._player.play(fragment, settings.volume)
+            # "speaking_start"/"speaking_end" обрамляют именно звучание, а не синтез и
+            # не паузу перед ним — интерфейс использует их, чтобы на это время прятать
+            # рамку области (см. SelectionOverlay.set_reading). finally гарантирует
+            # парный "speaking_end" и при обычном завершении, и при ранней остановке
+            # (_stop_event), и если воспроизведение само бросит исключение.
+            self._bus.emit("speaking_start", value=float(item.area))
+            try:
+                for fragment in fragments:
+                    if self._stop_event.is_set():
+                        return
+                    self._player.play(fragment, settings.volume)
+            finally:
+                self._bus.emit("speaking_end", value=float(item.area))
             self._last_area = item.area
             self._last_finished = time.monotonic()
         except TtsError as exc:

@@ -215,3 +215,84 @@ class StartupErrorAndHeaderTests(unittest.TestCase):
         self.win.update()
         label = self.win.subtitle_label
         self.assertLessEqual(label.winfo_reqwidth(), label.winfo_width())
+
+
+@unittest.skipUnless(_DISPLAY_AVAILABLE, "нет графического дисплея — тест окна пропущен")
+class SpeakingOverlayEventsTests(unittest.TestCase):
+    """
+    "speaking_start"/"speaking_end" из шины событий (workers.TtsPlaybackWorker)
+    должны прятать и возвращать рамку ИМЕННО той области, что сейчас звучит —
+    не все рамки сразу, и не рамку другой области. "skipped" должен попадать в
+    журнал. Сами значения прозрачности — забота overlay.SelectionOverlay.set_reading
+    (проверено отдельно); здесь проверяется только маршрутизация события к нужной
+    рамке, поэтому set_reading подменяется, а не проверяется по факту отрисовки.
+    """
+
+    def setUp(self):
+        self.win = gui.MainWindow()
+        self.win.update()
+
+    def tearDown(self):
+        try:
+            for after_id in self.win.tk.eval("after info").split():
+                self.win.after_cancel(after_id)
+        except tkinter.TclError:
+            pass
+        try:
+            for overlay in self.win.overlays:
+                overlay.destroy()
+            self.win.destroy()
+        except tkinter.TclError:
+            pass
+
+    def test_speaking_start_calls_set_reading_true_on_the_matching_overlay(self):
+        from workers import UiEvent
+        calls = []
+        self.win.overlays[0].set_reading = lambda reading: calls.append(reading)
+        self.win._handle_event(UiEvent(kind="speaking_start", value=0.0))
+        self.assertEqual(calls, [True])
+
+    def test_speaking_end_calls_set_reading_false_on_the_matching_overlay(self):
+        from workers import UiEvent
+        calls = []
+        self.win.overlays[0].set_reading = lambda reading: calls.append(reading)
+        self.win._handle_event(UiEvent(kind="speaking_end", value=0.0))
+        self.assertEqual(calls, [False])
+
+    def test_out_of_range_area_index_does_not_crash(self):
+        from workers import UiEvent
+        # По умолчанию существует только одна область (индекс 0) — индекс 5
+        # не должен ничего ломать, событие просто тихо игнорируется.
+        self.win._handle_event(UiEvent(kind="speaking_start", value=5.0))
+        self.win._handle_event(UiEvent(kind="speaking_end", value=5.0))
+
+    def test_skipped_event_is_logged(self):
+        from workers import UiEvent
+        self.win._handle_event(
+            UiEvent(kind="skipped", text="пропущено устаревших реплик: 2 — тест")
+        )
+        self.win.update()
+        content = self.win.log_box.get("1.0", "end")
+        self.assertIn("⏭", content)
+        self.assertIn("пропущено устаревших реплик: 2 — тест", content)
+
+    def test_stopped_event_resets_reading_state_on_every_overlay(self):
+        # Защита на случай, если слежение остановили прямо во время звучания
+        # реплики — ни одна рамка не должна остаться невидимой навсегда.
+        from workers import UiEvent
+        calls = []
+        self.win.overlays[0].set_reading = lambda reading: calls.append(reading)
+        self.win._handle_event(UiEvent(kind="stopped", text="Остановлено."))
+        self.assertIn(False, calls)
+
+    def test_multiple_areas_route_to_the_right_overlay_only(self):
+        from workers import UiEvent
+        self.win._add_area()
+        self.win.update()
+        self.assertEqual(len(self.win.overlays), 2)
+        calls0, calls1 = [], []
+        self.win.overlays[0].set_reading = lambda reading: calls0.append(reading)
+        self.win.overlays[1].set_reading = lambda reading: calls1.append(reading)
+        self.win._handle_event(UiEvent(kind="speaking_start", value=1.0))
+        self.assertEqual(calls0, [])
+        self.assertEqual(calls1, [True])

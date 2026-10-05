@@ -11,7 +11,9 @@
 нельзя было бы перетаскивать.
 """
 
+import ctypes
 import logging
+import sys
 import tkinter as tk
 from typing import Callable, Optional, Tuple
 
@@ -28,6 +30,14 @@ BORDER_COLOR = AREA_COLORS[0]
 FILL_COLOR = "#0b1d2a"
 IDLE_ALPHA = 0.30        # прозрачность, пока пользователь ничего не делает
 ACTIVE_ALPHA = 0.55      # прозрачность во время перетаскивания
+READING_ALPHA = 0.0      # прозрачность на время озвучки её области (0 — рамка не видна)
+
+# Исключает окно рамки из захвата экрана (Windows 10 версии 2004+ и Windows 11):
+# содержимое окна по-прежнему видно человеку на мониторе, но не попадает в кадр,
+# который снимает mss для распознавания. Без этого бордюр, подпись области и уголок
+# изменения размера накладывались бы поверх субтитров в каждом снимке и портили
+# распознавание текста — именно это раньше и приводило к ошибкам в прочитанном.
+_WDA_EXCLUDEFROMCAPTURE = 0x00000011
 
 
 class SelectionOverlay(ctk.CTkToplevel):
@@ -46,6 +56,7 @@ class SelectionOverlay(ctk.CTkToplevel):
         self._drag_offset: Tuple[int, int] = (0, 0)
         self._resize_origin: Tuple[int, int, int, int] = (0, 0, 0, 0)
         self._mode: str = ""
+        self._reading: bool = False   # True — сейчас звучит озвучка этой области
 
         left, top, width, height = roi
         self._last_roi: Tuple[int, int, int, int] = (
@@ -72,6 +83,8 @@ class SelectionOverlay(ctk.CTkToplevel):
         for key in ("<Left>", "<Right>", "<Up>", "<Down>"):
             self.bind(key, self._on_arrow)
         self.bind("<Escape>", lambda _e: self.hide())
+
+        self._exclude_from_capture()
 
     # -- публичные методы -----------------------------------------------------
 
@@ -120,6 +133,24 @@ class SelectionOverlay(ctk.CTkToplevel):
 
     def is_visible(self) -> bool:
         return bool(self.winfo_viewable())
+
+    def set_reading(self, reading: bool) -> None:
+        """
+        На время озвучки этой области делает рамку невидимой, чтобы она не
+        закрывала субтитры, пока их читают вслух; по окончании озвучки
+        возвращает обычную прозрачность.
+
+        Ничего не меняет, если рамка сейчас скрыта пользователем (кнопка
+        «Скрыть рамки») — скрытой рамке скрываться ещё раз незачем, а когда
+        пользователь покажет её снова, она должна появиться с обычной, а не
+        с «читающей» прозрачностью. Также ничего не меняет, пока пользователь
+        её перетаскивает или меняет размер (``_mode`` не пуст) — в этот момент
+        прозрачностью управляет ``_on_press``/``_on_release``.
+        """
+        self._reading = reading
+        if self._mode or not self.is_visible():
+            return
+        self._set_alpha(READING_ALPHA if reading else IDLE_ALPHA)
 
     # -- отрисовка ------------------------------------------------------------
 
@@ -209,3 +240,32 @@ class SelectionOverlay(ctk.CTkToplevel):
                 self._on_change(self.get_roi())
             except Exception:  # noqa: BLE001 — сбой обработчика не должен ломать оверлей
                 logger.exception("Ошибка в обработчике изменения области")
+
+    # -- захват экрана ----------------------------------------------------------
+
+    def _exclude_from_capture(self) -> None:
+        """
+        Исключает это окно из захвата экрана средствами Windows (см.
+        ``_WDA_EXCLUDEFROMCAPTURE`` выше) — необязательное улучшение, без
+        которого рамка продолжает работать как раньше, просто снимок для
+        распознавания будет включать и её контур.
+
+        На не-Windows системах, в старых версиях Windows без поддержки этого
+        флага и в любой другой непредвиденной ситуации тихо ничего не делает:
+        это дополнительная защита, а не обязательное условие работы программы.
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = self.winfo_id()
+            if not user32.SetWindowDisplayAffinity(hwnd, _WDA_EXCLUDEFROMCAPTURE):
+                # self.winfo_id() у безрамочного (overrideredirect) окна обычно и
+                # есть настоящий HWND, но на некоторых сборках Tk это id внутреннего
+                # дочернего окна, а нужный Windows — его родитель. Пробуем его как
+                # запасной вариант, прежде чем признать попытку неудачной.
+                parent = user32.GetParent(hwnd)
+                if parent:
+                    user32.SetWindowDisplayAffinity(parent, _WDA_EXCLUDEFROMCAPTURE)
+        except Exception:  # noqa: BLE001 — это необязательное улучшение, рамка не должна падать из-за него
+            logger.debug("Не удалось исключить рамку из захвата экрана.", exc_info=True)

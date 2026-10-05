@@ -381,6 +381,18 @@ class MainWindow(ctk.CTk):
         self.shared.update(overlay_visible=visible)
         self.settings.overlay_visible = visible
 
+    def _set_overlay_reading(self, area: int, reading: bool) -> None:
+        """
+        Прячет (или возвращает) рамку области ``area`` на время её озвучки —
+        обработчик событий "speaking_start"/"speaking_end" из потока озвучки
+        (см. workers.TtsPlaybackWorker и overlay.SelectionOverlay.set_reading).
+        Индекс области мог устареть, если пользователь только что удалил
+        область прямо во время звучания последней фразы из неё — тогда просто
+        ничего не делаем, а не падаем.
+        """
+        if 0 <= area < len(self.overlays):
+            self.overlays[area].set_reading(reading)
+
     # ------------------------------------------------------------------
     # Обработчики действий
     # ------------------------------------------------------------------
@@ -550,6 +562,12 @@ class MainWindow(ctk.CTk):
             self._log(f"📖 {event.text}")
         elif event.kind == "spoken":
             self._log(f"🔊 озвучено за {event.value:.2f} с")
+        elif event.kind == "skipped":
+            self._log(f"⏭ {event.text}")
+        elif event.kind == "speaking_start":
+            self._set_overlay_reading(int(event.value), True)
+        elif event.kind == "speaking_end":
+            self._set_overlay_reading(int(event.value), False)
         elif event.kind == "error":
             if self._starting:
                 # Ошибка при запуске: движок останавливается сам. Причина должна быть видна сразу,
@@ -564,6 +582,10 @@ class MainWindow(ctk.CTk):
         elif event.kind == "stopped":
             self._starting = False
             self._hide_progress()
+            # На случай, если слежение остановили прямо во время звучания
+            # реплики: ни одна рамка не должна остаться невидимой насовсем.
+            for overlay in self.overlays:
+                overlay.set_reading(False)
             if self._startup_failed:
                 self._startup_failed = False
                 self._set_status("Ошибка запуска", COLOR_ERROR)
