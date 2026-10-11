@@ -28,7 +28,7 @@ if _DISPLAY_AVAILABLE:
     import customtkinter as ctk
 
     import overlay as overlay_module
-    from overlay import ACTIVE_ALPHA, IDLE_ALPHA, READING_ALPHA, SelectionOverlay
+    from overlay import ACTIVE_ALPHA, IDLE_ALPHA, READING_ALPHA, SelectionOverlay, _clamp01
 
 
 class _FakeUser32:
@@ -172,6 +172,135 @@ class SetReadingTests(unittest.TestCase):
         self.root.update()
         self.overlay.set_reading(True)
         self.assertTrue(self.overlay._reading)
+
+
+class Clamp01Tests(unittest.TestCase):
+    """
+    _clamp01() — чистая функция, тест без tkinter и без дисплея (в отличие от
+    остальных тестов этого файла, которым нужно настоящее окно).
+    """
+
+    def test_within_range_is_unchanged(self):
+        self.assertEqual(overlay_module._clamp01(0.42), 0.42)
+
+    def test_below_zero_is_clamped_to_zero(self):
+        self.assertEqual(overlay_module._clamp01(-1.0), 0.0)
+
+    def test_above_one_is_clamped_to_one(self):
+        self.assertEqual(overlay_module._clamp01(5.0), 1.0)
+
+    def test_non_numeric_falls_back_to_idle_alpha(self):
+        self.assertEqual(overlay_module._clamp01("не число"), overlay_module.IDLE_ALPHA)
+
+    def test_none_falls_back_to_idle_alpha(self):
+        self.assertEqual(overlay_module._clamp01(None), overlay_module.IDLE_ALPHA)
+
+
+@unittest.skipUnless(_DISPLAY_AVAILABLE, "нет графического дисплея — тест окна пропущен")
+class OverlayAlphaSettingTests(unittest.TestCase):
+    """
+    Настраиваемая прозрачность рамки вне момента озвучки (ползунок
+    «Прозрачность рамки» в окне программы, см. gui.py и config.overlay_alpha):
+    конструктор принимает начальное значение, а set_idle_alpha() меняет его
+    «вживую», с учётом того, в каком состоянии рамка находится прямо сейчас.
+    """
+
+    def tearDown(self):
+        try:
+            for after_id in self.root.tk.eval("after info").split():
+                self.root.after_cancel(after_id)
+        except (tkinter.TclError, AttributeError):
+            pass
+        try:
+            self.overlay.destroy()
+            self.root.destroy()
+        except (tkinter.TclError, AttributeError):
+            pass
+
+    def _make_overlay(self, idle_alpha=IDLE_ALPHA):
+        self.root = ctk.CTk()
+        self.root.withdraw()
+        self.overlay = SelectionOverlay(self.root, (10, 10, 300, 100), index=0, idle_alpha=idle_alpha)
+        self.overlay.show()
+        self.root.update()
+        # См. комментарий в SetReadingTests.setUp — тот же приём для той же
+        # особенности некоторых X11-окружений без compositor'а.
+        self.overlay._set_alpha(idle_alpha)
+        self.root.update()
+        return self.overlay
+
+    def test_constructor_applies_the_given_idle_alpha(self):
+        overlay = self._make_overlay(idle_alpha=0.65)
+        self.assertAlmostEqual(overlay.attributes("-alpha"), 0.65, places=6)
+
+    def test_constructor_clamps_an_out_of_range_value(self):
+        overlay = self._make_overlay(idle_alpha=3.0)
+        self.assertAlmostEqual(overlay.attributes("-alpha"), 1.0, places=6)
+
+    def test_set_idle_alpha_applies_immediately_in_idle_state(self):
+        overlay = self._make_overlay()
+        overlay.set_idle_alpha(0.0)
+        self.root.update()
+        self.assertAlmostEqual(overlay.attributes("-alpha"), 0.0, places=6)
+        self.assertTrue(overlay.is_visible(), "0.0 делает рамку невидимой, но не withdraw()")
+
+    def test_set_idle_alpha_is_clamped(self):
+        overlay = self._make_overlay()
+        overlay.set_idle_alpha(-2.0)
+        self.root.update()
+        self.assertAlmostEqual(overlay.attributes("-alpha"), 0.0, places=6)
+
+    def test_set_idle_alpha_while_reading_does_not_change_visible_alpha_yet(self):
+        overlay = self._make_overlay()
+        overlay.set_reading(True)
+        self.root.update()
+        overlay.set_idle_alpha(0.9)
+        self.root.update()
+        # Пока идёт чтение, видимый эффект — всё ещё READING_ALPHA (рамка не
+        # видна), а не только что установленное значение.
+        self.assertAlmostEqual(overlay.attributes("-alpha"), READING_ALPHA, places=6)
+
+    def test_new_idle_alpha_applies_once_reading_ends(self):
+        overlay = self._make_overlay()
+        overlay.set_reading(True)
+        self.root.update()
+        overlay.set_idle_alpha(0.9)
+        overlay.set_reading(False)
+        self.root.update()
+        self.assertAlmostEqual(overlay.attributes("-alpha"), 0.9, places=6)
+
+    def test_set_idle_alpha_while_dragging_does_not_change_visible_alpha_yet(self):
+        overlay = self._make_overlay()
+        overlay._mode = "move"
+        overlay._set_alpha(ACTIVE_ALPHA)
+        self.root.update()
+        overlay.set_idle_alpha(0.9)
+        self.root.update()
+        self.assertAlmostEqual(overlay.attributes("-alpha"), ACTIVE_ALPHA, places=6)
+        overlay._mode = ""
+
+    def test_new_idle_alpha_applies_on_release(self):
+        overlay = self._make_overlay()
+        overlay._mode = "move"
+        overlay._set_alpha(ACTIVE_ALPHA)
+        self.root.update()
+        overlay.set_idle_alpha(0.9)
+        overlay._on_release(None)
+        self.root.update()
+        self.assertAlmostEqual(overlay.attributes("-alpha"), 0.9, places=6)
+
+    def test_release_while_reading_keeps_the_overlay_invisible(self):
+        # Если пользователь как-то умудрился отпустить кнопку мыши именно в
+        # момент, когда область уже снова читается (редкий, но возможный по
+        # времени случай) — отпускание не должно «выключить» READING_ALPHA.
+        overlay = self._make_overlay()
+        overlay._reading = True
+        overlay._mode = "move"
+        overlay._set_alpha(ACTIVE_ALPHA)
+        self.root.update()
+        overlay._on_release(None)
+        self.root.update()
+        self.assertAlmostEqual(overlay.attributes("-alpha"), READING_ALPHA, places=6)
 
 
 @unittest.skipUnless(_DISPLAY_AVAILABLE, "нет графического дисплея — тест окна пропущен")

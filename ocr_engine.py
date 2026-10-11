@@ -21,7 +21,21 @@ import config
 logger = logging.getLogger("neurovox.ocr")
 
 # Отбрасываем результаты EasyOCR, в которых он не уверен.
-EASYOCR_MIN_CONFIDENCE = 0.30
+#
+# Было 0.30 — на практике это слишком низкий порог: EasyOCR сам сообщает
+# уверенность 0.3-0.5 на фрагментах, которые на деле — не субтитр, а шум
+# сцены (движущийся фон, блики, посторонние надписи в игре), и с порогом
+# 0.30 такие фрагменты всё равно проходили и озвучивались как бессвязный
+# набор слов («ree . И бласть ин: рай BR 4 Буквально...»). 0.55 отсекает
+# основную массу такого шума, оставляя при этом уверенно читаемые субтитры
+# (настоящий печатный текст субтитров EasyOCR обычно распознаёт с
+# уверенностью 0.7-0.99) — для субтитров лучше молчать на неясном кадре,
+# чем озвучить искажённую фразу.
+EASYOCR_MIN_CONFIDENCE = 0.55
+
+# То же самое для Tesseract, но в его собственной шкале — он сообщает
+# уверенность в процентах (0-100), а не долей от 0 до 1, как EasyOCR.
+TESSERACT_MIN_CONFIDENCE = 55.0
 
 
 class OcrError(Exception):
@@ -154,13 +168,42 @@ class TesseractEngine(BaseOcr):
         if self._pytesseract is None:
             raise OcrError("Движок Tesseract не инициализирован.")
         try:
-            # psm 6 — единый блок текста (подходит и для одно-, и для двухстрочных субтитров).
-            text = self._pytesseract.image_to_string(
-                image, lang="rus+eng", config="--oem 1 --psm 6"
+            # image_to_data вместо image_to_string: даёт уверенность по
+            # каждому распознанному слову, как и EasyOCR (см.
+            # EASYOCR_MIN_CONFIDENCE) — раньше Tesseract такой проверки не
+            # делал вовсе и отдавал в озвучку вообще всё, что хоть
+            # отдалённо напомнило ему буквы, включая случайный шум сцены.
+            # psm 6 — единый блок текста (подходит и для одно-, и для
+            # двухстрочных субтитров).
+            data = self._pytesseract.image_to_data(
+                image,
+                lang="rus+eng",
+                config="--oem 1 --psm 6",
+                output_type=self._pytesseract.Output.DICT,
             )
         except Exception as exc:  # noqa: BLE001
             raise OcrError(f"Ошибка распознавания Tesseract: {exc}") from exc
-        return " ".join(text.split())
+
+        words = []
+        for word, conf in zip(data.get("text", []), data.get("conf", [])):
+            word = word.strip()
+            if not word:
+                continue
+            try:
+                confidence = float(conf)
+            except (TypeError, ValueError):
+                continue
+            # conf == -1 у Tesseract означает «это не слово, а служебная
+            # строка разметки» (блок/абзац/строка) — такие записи у него не
+            # несут текста и всегда отфильтровываются самой проверкой word
+            # выше, но на всякий случай пропускаем и отрицательную
+            # уверенность явно. TESSERACT_MIN_CONFIDENCE — в процентах
+            # (0-100), как и возвращает Tesseract, в отличие от EasyOCR,
+            # который отдаёт уверенность от 0 до 1.
+            if confidence < TESSERACT_MIN_CONFIDENCE:
+                continue
+            words.append(word)
+        return " ".join(words)
 
 
 # ---------------------------------------------------------------------------

@@ -40,6 +40,15 @@ READING_ALPHA = 0.0      # прозрачность на время озвучк
 _WDA_EXCLUDEFROMCAPTURE = 0x00000011
 
 
+def _clamp01(value: float) -> float:
+    """Ограничивает прозрачность диапазоном 0.0-1.0 (на случай некорректного ввода извне)."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return IDLE_ALPHA
+    return max(0.0, min(1.0, value))
+
+
 class SelectionOverlay(ctk.CTkToplevel):
     """Рамка выбора области захвата, которую можно двигать и растягивать."""
 
@@ -49,6 +58,7 @@ class SelectionOverlay(ctk.CTkToplevel):
         roi: Tuple[int, int, int, int],
         on_change: Optional[Callable[[Tuple[int, int, int, int]], None]] = None,
         index: int = 0,
+        idle_alpha: float = IDLE_ALPHA,
     ) -> None:
         super().__init__(master)
         self._on_change = on_change
@@ -57,6 +67,13 @@ class SelectionOverlay(ctk.CTkToplevel):
         self._resize_origin: Tuple[int, int, int, int] = (0, 0, 0, 0)
         self._mode: str = ""
         self._reading: bool = False   # True — сейчас звучит озвучка этой области
+        # Прозрачность рамки вне момента озвучки — настраивается пользователем
+        # ползунком «Прозрачность рамки» (см. set_idle_alpha и gui.py). Хранится
+        # как поле экземпляра, а не читается из модульной константы IDLE_ALPHA
+        # напрямую, именно чтобы разные рамки могли бы в будущем иметь разную
+        # прозрачность и чтобы её можно было поменять «вживую», пока программа
+        # уже запущена, без пересоздания окна.
+        self._idle_alpha: float = _clamp01(idle_alpha)
 
         left, top, width, height = roi
         self._last_roi: Tuple[int, int, int, int] = (
@@ -64,7 +81,7 @@ class SelectionOverlay(ctk.CTkToplevel):
         )
         self.overrideredirect(True)                 # без рамки и заголовка
         self.attributes("-topmost", True)           # поверх всех окон (в т.ч. игры в оконном режиме)
-        self._set_alpha(IDLE_ALPHA)
+        self._set_alpha(self._idle_alpha)
         self.configure(fg_color=FILL_COLOR)
         self.geometry(f"{max(width, MIN_WIDTH)}x{max(height, MIN_HEIGHT)}+{left}+{top}")
         self.title(f"NeuroVox — область захвата {index + 1}")
@@ -134,6 +151,41 @@ class SelectionOverlay(ctk.CTkToplevel):
     def is_visible(self) -> bool:
         return bool(self.winfo_viewable())
 
+    # -- скрытие на время снимка для OCR --------------------------------------
+
+    def withdraw_for_capture(self) -> bool:
+        """
+        Мгновенно убирает окно рамки с экрана перед снимком для распознавания
+        (см. MainWindow._hide_overlays_for_capture в gui.py).
+
+        Это запасной, гарантированно надёжный способ убрать рамку из кадра —
+        в отличие от _exclude_from_capture() (которая исключает окно из
+        захвата средствами Windows, но на некоторых системах и при некоторых
+        способах захвата экрана, например через GDI/BitBlt, которым
+        пользуется mss, может не действовать), withdraw() физически убирает
+        окно с экрана, и его не может увидеть ничто, что снимает экран.
+
+        Ничего не делает и возвращает False, если рамка и так не видна
+        (скрыта пользователем кнопкой «Скрыть рамки», либо пользователь как
+        раз её перетаскивает или меняет размер) — тогда и восстанавливать
+        после снимка нечего. Возвращает True, если рамку действительно
+        пришлось спрятать (и, значит, после снимка её нужно вернуть
+        restore_after_capture()).
+        """
+        if self._mode or not self.is_visible():
+            return False
+        self.withdraw()
+        return True
+
+    def restore_after_capture(self) -> None:
+        """
+        Возвращает рамку на экран после снимка, спрятанного
+        withdraw_for_capture(). Не меняет прозрачность — она уже была
+        выставлена верно (обычная или «читающая») до скрытия.
+        """
+        self.deiconify()
+        self.attributes("-topmost", True)
+
     def set_reading(self, reading: bool) -> None:
         """
         На время озвучки этой области делает рамку невидимой, чтобы она не
@@ -150,7 +202,26 @@ class SelectionOverlay(ctk.CTkToplevel):
         self._reading = reading
         if self._mode or not self.is_visible():
             return
-        self._set_alpha(READING_ALPHA if reading else IDLE_ALPHA)
+        self._set_alpha(READING_ALPHA if reading else self._idle_alpha)
+
+    def set_idle_alpha(self, value: float) -> None:
+        """
+        Меняет прозрачность рамки вне момента озвучки (см. ползунок
+        «Прозрачность рамки» в окне программы) и, если рамка сейчас как раз
+        в этом обычном состоянии — применяет новое значение немедленно, не
+        дожидаясь следующего show()/set_reading(False).
+
+        Если в этот момент рамка читается (``_reading``), перетаскивается
+        или меняет размер (``_mode``), новое значение только запоминается —
+        видимый эффект применится позже, когда она вернётся в обычное
+        состояние (set_reading(False) или _on_release), точно так же, как
+        это уже устроено для READING_ALPHA/ACTIVE_ALPHA и обычной
+        IDLE_ALPHA до появления этой настройки.
+        """
+        self._idle_alpha = _clamp01(value)
+        if self._mode or self._reading or not self.is_visible():
+            return
+        self._set_alpha(self._idle_alpha)
 
     # -- отрисовка ------------------------------------------------------------
 
@@ -218,7 +289,7 @@ class SelectionOverlay(ctk.CTkToplevel):
 
     def _on_release(self, _event) -> None:
         self._mode = ""
-        self._set_alpha(IDLE_ALPHA)
+        self._set_alpha(READING_ALPHA if self._reading else self._idle_alpha)
         self._notify()
 
     def _on_arrow(self, event) -> None:

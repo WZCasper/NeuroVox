@@ -14,7 +14,14 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import config  # noqa: E402
-from workers import EventBus, NeuroVoxEngine, SharedSettings, _AreaHealthMonitor  # noqa: E402
+from workers import (  # noqa: E402
+    CaptureWorker,
+    EventBus,
+    NeuroVoxEngine,
+    OverlayCaptureGate,
+    SharedSettings,
+    _AreaHealthMonitor,
+)
 
 from tests.pipeline_fakes import run_pipeline  # noqa: E402
 
@@ -430,6 +437,203 @@ class OcrWorkerHealthIntegrationTests(unittest.TestCase):
         events = bus.poll(limit=500)
         warnings = [e.text for e in events if e.kind == "error" and "не обнаруживаются" in e.text]
         self.assertFalse(warnings, f"не ожидалось предупреждений, но получено: {warnings}")
+
+
+class OverlayCaptureGateTests(unittest.TestCase):
+    """
+    Прямые тесты моста OverlayCaptureGate — без настоящих окон и без
+    потока снимков: только протокол install/request_hide/request_show/poll,
+    каким его используют gui.MainWindow и workers.CaptureWorker._grab_area.
+    """
+
+    def test_request_hide_without_install_returns_false_immediately(self):
+        # Ничего не зарегистрировано (GUI ещё не запустило слежение, либо
+        # это тест/preview без окна вообще) — не должно ни блокировать
+        # вызывающий поток, ни притворяться, что рамка спрятана.
+        gate = OverlayCaptureGate()
+        self.assertFalse(gate.request_hide())
+
+    def test_hide_then_poll_confirms_and_calls_hide_fn(self):
+        gate = OverlayCaptureGate()
+        calls = []
+        gate.install(lambda: calls.append("hide"), lambda: calls.append("show"))
+
+        result = {}
+
+        def worker():
+            result["confirmed"] = gate.request_hide()
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        # Имитируем короткий таймер GUI (gui._poll_gate): рано или поздно он
+        # должен увидеть запрос и выполнить hide_fn.
+        deadline = time.monotonic() + 2.0
+        while "confirmed" not in result and time.monotonic() < deadline:
+            gate.poll()
+            time.sleep(0.005)
+        thread.join(timeout=1.0)
+
+        self.assertEqual(calls, ["hide"])
+        self.assertTrue(result.get("confirmed"))
+
+    def test_show_is_called_after_hide_on_next_poll(self):
+        gate = OverlayCaptureGate()
+        calls = []
+        gate.install(lambda: calls.append("hide"), lambda: calls.append("show"))
+
+        def worker():
+            gate.request_hide()
+            gate.request_show()
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        deadline = time.monotonic() + 2.0
+        while calls.count("show") == 0 and time.monotonic() < deadline:
+            gate.poll()
+            time.sleep(0.005)
+        thread.join(timeout=1.0)
+
+        self.assertEqual(calls, ["hide", "show"])
+
+    def test_uninstall_releases_any_waiting_request(self):
+        # Если GUI закрылось (или слежение остановили) ровно в момент, когда
+        # поток снимков ждёт подтверждения hide — он не должен зависнуть
+        # навсегда: uninstall() обязан немедленно освободить ожидание.
+        gate = OverlayCaptureGate()
+        gate.install(lambda: None, lambda: None)
+
+        result = {}
+
+        def worker():
+            result["confirmed"] = gate.request_hide()
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        time.sleep(0.05)   # даём worker-потоку дойти до wait() внутри request_hide
+        gate.uninstall()
+        thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive(), "поток не должен был зависнуть после uninstall()")
+
+    def test_request_hide_after_uninstall_returns_false(self):
+        gate = OverlayCaptureGate()
+        gate.install(lambda: None, lambda: None)
+        gate.uninstall()
+        self.assertFalse(gate.request_hide())
+
+    def test_request_show_without_install_is_a_no_op(self):
+        gate = OverlayCaptureGate()
+        gate.request_show()  # не должно поднять исключение
+
+    def test_poll_without_pending_request_does_nothing(self):
+        gate = OverlayCaptureGate()
+        calls = []
+        gate.install(lambda: calls.append("hide"), lambda: calls.append("show"))
+        gate.poll()
+        self.assertEqual(calls, [])
+
+
+class CaptureWorkerOverlayGateIntegrationTests(unittest.TestCase):
+    """
+    CaptureWorker._grab_area() — убеждаемся, что при установленном
+    overlay_gate каждый снимок области действительно обёрнут в
+    request_hide()/request_show(), а без gate (как раньше) ничего не
+    меняется в поведении снимка.
+    """
+
+    def test_grab_area_calls_hide_then_show_around_the_snapshot(self):
+        gate = OverlayCaptureGate()
+        order = []
+        gate.install(lambda: order.append("hide"), lambda: order.append("show"))
+
+        class _Capture:
+            def grab(self, roi):
+                order.append("grab")
+                return "image"
+
+        shared = SharedSettings(config.Settings())
+        worker = CaptureWorker(
+            shared, EventBus(), buffer=None, stop_event=threading.Event(),
+            overlay_gate=gate,
+        )
+
+        # poll() на отдельном потоке, пока идёт снимок — так же, как в
+        # реальной программе это делает gui._poll_gate на быстром таймере.
+        stop_polling = threading.Event()
+
+        def poller():
+            while not stop_polling.is_set():
+                gate.poll()
+                time.sleep(0.005)
+
+        poll_thread = threading.Thread(target=poller)
+        poll_thread.start()
+        try:
+            image = worker._grab_area(_Capture(), (0, 0, 10, 10))
+            # request_show() внутри _grab_area только ставит запрос в
+            # очередь и не ждёт его выполнения (см. docstring
+            # OverlayCaptureGate.request_show) — ждём здесь явно, в тесте,
+            # пока poller-поток его не обработает.
+            deadline = time.monotonic() + 2.0
+            while "show" not in order and time.monotonic() < deadline:
+                time.sleep(0.005)
+        finally:
+            stop_polling.set()
+            poll_thread.join(timeout=1.0)
+
+        self.assertEqual(image, "image")
+        self.assertEqual(order, ["hide", "grab", "show"])
+
+    def test_grab_area_without_gate_just_grabs(self):
+        class _Capture:
+            def grab(self, roi):
+                return "image"
+
+        shared = SharedSettings(config.Settings())
+        worker = CaptureWorker(
+            shared, EventBus(), buffer=None, stop_event=threading.Event(),
+            overlay_gate=None,
+        )
+        self.assertEqual(worker._grab_area(_Capture(), (0, 0, 10, 10)), "image")
+
+    def test_grab_area_shows_again_even_if_grab_raises(self):
+        # Рамка не должна остаться спрятанной насовсем, если сам снимок
+        # почему-то бросил исключение (например, CaptureError).
+        gate = OverlayCaptureGate()
+        order = []
+        gate.install(lambda: order.append("hide"), lambda: order.append("show"))
+
+        class _FailingCapture:
+            def grab(self, roi):
+                order.append("grab")
+                raise RuntimeError("симуляция сбоя снимка")
+
+        shared = SharedSettings(config.Settings())
+        worker = CaptureWorker(
+            shared, EventBus(), buffer=None, stop_event=threading.Event(),
+            overlay_gate=gate,
+        )
+
+        stop_polling = threading.Event()
+
+        def poller():
+            while not stop_polling.is_set():
+                gate.poll()
+                time.sleep(0.005)
+
+        poll_thread = threading.Thread(target=poller)
+        poll_thread.start()
+        try:
+            with self.assertRaises(RuntimeError):
+                worker._grab_area(_FailingCapture(), (0, 0, 10, 10))
+            deadline = time.monotonic() + 2.0
+            while "show" not in order and time.monotonic() < deadline:
+                time.sleep(0.005)
+        finally:
+            stop_polling.set()
+            poll_thread.join(timeout=1.0)
+
+        self.assertEqual(order, ["hide", "grab", "show"])
 
 
 if __name__ == "__main__":

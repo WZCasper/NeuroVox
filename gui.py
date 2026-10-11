@@ -13,18 +13,26 @@ import sys
 import time
 import tkinter as tk
 from tkinter import messagebox
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import customtkinter as ctk
 
 import config
 from overlay import SelectionOverlay
 from pronunciation import StressDictionary
-from workers import EventBus, NeuroVoxEngine, SharedSettings
+from workers import EventBus, NeuroVoxEngine, OverlayCaptureGate, SharedSettings
 
 logger = logging.getLogger("neurovox.gui")
 
 POLL_INTERVAL_MS = 100
+# Таймер, которым окно обслуживает запросы «спрячь/покажи рамки» от потока
+# снимков (см. workers.OverlayCaptureGate) — работает только пока идёт
+# слежение (_install_capture_gate / _uninstall_capture_gate), и специально
+# гораздо чаще обычного POLL_INTERVAL_MS: поток снимков ждёт ответа не
+# дольше OverlayCaptureGate._RESPONSE_TIMEOUT_S (250 мс), а снимки при
+# capture_fps по умолчанию идут примерно раз в 67 мс, поэтому опрос должен
+# быть ощутимо быстрее обоих, иначе рамка не будет успевать прятаться.
+OVERLAY_GATE_POLL_MS = 15
 MAX_LOG_LINES = 400
 
 OCR_LABELS = {
@@ -93,10 +101,12 @@ class MainWindow(ctk.CTk):
         self.settings = config.Settings.load()
         self.shared = SharedSettings(self.settings)
         self.bus = EventBus()
-        self.engine = NeuroVoxEngine(self.shared, self.bus)
+        self._overlay_gate = OverlayCaptureGate()
+        self.engine = NeuroVoxEngine(self.shared, self.bus, overlay_gate=self._overlay_gate)
         self.overlays: List[SelectionOverlay] = []   # по одной рамке на область; создаются после интерфейса
         self._area_widgets: List[ctk.CTkBaseClass] = []
         self._stress_dictionary = StressDictionary()
+        self._gate_poll_job: Optional[str] = None
 
         self._voice_by_label: Dict[str, str] = {label: key for key, label in config.SILERO_SPEAKERS.items()}
         self._engine_by_label: Dict[str, str] = {label: key for key, label in OCR_LABELS.items()}
@@ -265,16 +275,30 @@ class MainWindow(ctk.CTk):
         self.pause_value = ctk.CTkLabel(pause_frame, text=f"{self.settings.area_pause:.1f} с", width=54)
         self.pause_value.grid(row=0, column=1, padx=(8, 0))
 
-        add_row(6, "Язык распознавания")
+        add_row(6, "Прозрачность рамки")
+        alpha_frame = ctk.CTkFrame(options, fg_color="transparent")
+        alpha_frame.grid(row=6, column=1, padx=(0, 16), pady=8, sticky="ew")
+        alpha_frame.grid_columnconfigure(0, weight=1)
+        self.overlay_alpha_slider = ctk.CTkSlider(
+            alpha_frame, from_=0.0, to=1.0, number_of_steps=20, command=self._on_overlay_alpha_change,
+        )
+        self.overlay_alpha_slider.set(self.settings.overlay_alpha)
+        self.overlay_alpha_slider.grid(row=0, column=0, sticky="ew")
+        self.overlay_alpha_value = ctk.CTkLabel(
+            alpha_frame, text=self._overlay_alpha_label(self.settings.overlay_alpha), width=70,
+        )
+        self.overlay_alpha_value.grid(row=0, column=1, padx=(8, 0))
+
+        add_row(7, "Язык распознавания")
         ctk.CTkLabel(options, text="Русский (ru)", anchor="w", text_color=COLOR_IDLE).grid(
-            row=6, column=1, padx=(0, 16), pady=8, sticky="w"
+            row=7, column=1, padx=(0, 16), pady=8, sticky="w"
         )
 
-        add_row(7, "Ударения в словах")
+        add_row(8, "Ударения в словах")
         ctk.CTkButton(
             options, text="Открыть словарь ударений", command=self._open_stress_dictionary,
             fg_color="#3a4358", hover_color="#2d3547",
-        ).grid(row=7, column=1, padx=(0, 16), pady=(8, 12), sticky="ew")
+        ).grid(row=8, column=1, padx=(0, 16), pady=(8, 12), sticky="ew")
 
         # -- журнал ---------------------------------------------------------
         log_frame = ctk.CTkFrame(self, corner_radius=12)
@@ -303,7 +327,10 @@ class MainWindow(ctk.CTk):
 
     def _create_overlays(self) -> None:
         for index, roi in enumerate(self.settings.rois):
-            overlay = SelectionOverlay(self, tuple(roi), on_change=self._on_roi_change, index=index)
+            overlay = SelectionOverlay(
+                self, tuple(roi), on_change=self._on_roi_change, index=index,
+                idle_alpha=self.settings.overlay_alpha,
+            )
             if not self.settings.overlay_visible:
                 overlay.hide()
             self.overlays.append(overlay)
@@ -321,7 +348,8 @@ class MainWindow(ctk.CTk):
             self._log(f"⚠ Больше {config.MAX_AREAS} областей добавить нельзя.")
             return
         overlay = SelectionOverlay(
-            self, self._suggest_new_roi(), on_change=self._on_roi_change, index=len(self.overlays)
+            self, self._suggest_new_roi(), on_change=self._on_roi_change, index=len(self.overlays),
+            idle_alpha=self.settings.overlay_alpha,
         )
         self.overlays.append(overlay)
         if not self.settings.overlay_visible:
@@ -394,6 +422,60 @@ class MainWindow(ctk.CTk):
             self.overlays[area].set_reading(reading)
 
     # ------------------------------------------------------------------
+    # Мост к потоку снимков: прятать рамки на время снимка для OCR
+    # ------------------------------------------------------------------
+
+    def _install_capture_gate(self) -> None:
+        """
+        Включает OverlayCaptureGate на время слежения: регистрирует колбэки
+        скрытия/показа рамок и запускает быстрый таймер, которым окно
+        обслуживает запросы потока снимков (см. workers.OverlayCaptureGate
+        и capture.CaptureWorker._grab_area — там же объяснено, зачем это
+        вообще нужно: Windows-флаг исключения окна из захвата действует не
+        на всех системах, а это — гарантированно надёжный запасной способ).
+        """
+        self._overlay_gate.install(self._hide_overlays_for_capture, self._show_overlays_after_capture)
+        self._schedule_gate_poll()
+
+    def _uninstall_capture_gate(self) -> None:
+        """Выключает мост при остановке слежения — поток снимков перестаёт ждать ответа."""
+        if self._gate_poll_job is not None:
+            self.after_cancel(self._gate_poll_job)
+            self._gate_poll_job = None
+        self._overlay_gate.uninstall()
+        # На случай, если слежение остановили ровно в момент, когда рамка
+        # была спрятана для снимка — не оставляем её невидимой насовсем.
+        # Но только если пользователь сам не прятал рамки заранее кнопкой
+        # «Скрыть рамки» (self.settings.overlay_visible == False) — тогда
+        # им и положено оставаться скрытыми после остановки.
+        if self.settings.overlay_visible:
+            for overlay in self.overlays:
+                if not overlay.is_visible():
+                    overlay.restore_after_capture()
+
+    def _schedule_gate_poll(self) -> None:
+        self._gate_poll_job = self.after(OVERLAY_GATE_POLL_MS, self._poll_gate)
+
+    def _poll_gate(self) -> None:
+        try:
+            self._overlay_gate.poll()
+        except Exception:  # noqa: BLE001 — сбой моста не должен остановить слежение
+            logger.exception("Ошибка обслуживания скрытия рамок для снимка")
+        finally:
+            if self.engine.is_running or self._starting:
+                self._schedule_gate_poll()
+            else:
+                self._gate_poll_job = None
+
+    def _hide_overlays_for_capture(self) -> None:
+        for overlay in self.overlays:
+            overlay.withdraw_for_capture()
+
+    def _show_overlays_after_capture(self) -> None:
+        for overlay in self.overlays:
+            overlay.restore_after_capture()
+
+    # ------------------------------------------------------------------
     # Обработчики действий
     # ------------------------------------------------------------------
 
@@ -411,11 +493,13 @@ class MainWindow(ctk.CTk):
         self.settings.save()
         self._set_status("Подготовка...", COLOR_LOADING)
         self.start_button.configure(text="■  Остановить", fg_color="#c0392b", hover_color="#992d22")
+        self._install_capture_gate()
         self.engine.start()
 
     def _stop(self) -> None:
         self._starting = False
         self.engine.stop()
+        self._uninstall_capture_gate()
         self._set_status("Остановка...", COLOR_LOADING)
         self.start_button.configure(state="disabled")
 
@@ -518,6 +602,27 @@ class MainWindow(ctk.CTk):
         self.volume_value.configure(text=f"{int(value * 100)}%")
         self.shared.update(volume=value)
         self.settings.volume = value
+
+    @staticmethod
+    def _overlay_alpha_label(value: float) -> str:
+        # При 0% рамка полностью не видна, поэтому для этого конкретного
+        # значения подпись говорит об этом прямо, а не просто «0%», которое
+        # легко принять за опечатку или не до конца понять на глаз.
+        return "не видна" if value <= 0.0 else f"{int(round(value * 100))}%"
+
+    def _on_overlay_alpha_change(self, value: float) -> None:
+        """
+        Ползунок «Прозрачность рамки»: применяется немедленно ко всем уже
+        существующим рамкам (см. SelectionOverlay.set_idle_alpha), а не
+        только к тем, что будут созданы заново при следующем запуске
+        программы — иначе эффект был бы незаметен до перезапуска.
+        """
+        value = round(float(value), 2)
+        self.overlay_alpha_value.configure(text=self._overlay_alpha_label(value))
+        self.shared.update(overlay_alpha=value)
+        self.settings.overlay_alpha = value
+        for overlay in self.overlays:
+            overlay.set_idle_alpha(value)
 
     def _on_engine_change(self, label: str) -> None:
         engine = self._engine_by_label.get(label, config.DEFAULT_OCR_ENGINE)
@@ -650,6 +755,7 @@ class MainWindow(ctk.CTk):
         except Exception:  # noqa: BLE001
             logger.exception("Не удалось сохранить настройки при выходе")
         self.engine.stop()
+        self._uninstall_capture_gate()
         for overlay in self.overlays:
             try:
                 overlay.destroy()

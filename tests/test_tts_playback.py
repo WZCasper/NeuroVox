@@ -13,12 +13,16 @@
 import pathlib
 import queue
 import sys
+import threading
 import time
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from workers import SpeechItem, skip_stale_duplicates  # noqa: E402
+import numpy as np  # noqa: E402
+
+import config  # noqa: E402
+from workers import EventBus, SharedSettings, SpeechItem, TtsPlaybackWorker, skip_stale_duplicates  # noqa: E402
 
 from tests.pipeline_fakes import run_pipeline, segments  # noqa: E402
 
@@ -218,6 +222,126 @@ class TtsBacklogCatchUpIntegrationTests(unittest.TestCase):
             spoken_area1, expected_area1_order,
             "перегрузка области 0 не должна пропускать или переставлять реплики области 1",
         )
+
+
+class _TimedFakeTts:
+    """
+    Подделка SileroTts, у которой synthesize() занимает заданное время — чтобы
+    явно проверить, что TtsPlaybackWorker готовит следующую реплику ЗАРАНЕЕ, а
+    не добавляет время синтеза к задержке каждой реплики по очереди.
+    """
+
+    model_name = "fake"
+    is_loaded = True
+
+    def __init__(self, synth_seconds: float) -> None:
+        self._synth_seconds = synth_seconds
+        self.synthesize_calls: "list[str]" = []
+
+    def synthesize(self, text: str, speaker: str, speed: float = 1.0):
+        self.synthesize_calls.append(text)
+        time.sleep(self._synth_seconds)
+        return [np.zeros(8, dtype=np.float32)]
+
+
+class _TimedFakePlayer:
+    """Подделка AudioPlayer, у которой play() занимает заданное время (блокирующе, как настоящий)."""
+
+    def __init__(self, play_seconds: float) -> None:
+        self._play_seconds = play_seconds
+        self.play_started_at: "list[float]" = []
+
+    def play(self, samples, volume: float = 1.0) -> None:
+        self.play_started_at.append(time.monotonic())
+        time.sleep(self._play_seconds)
+
+    def stop(self) -> None:
+        pass
+
+
+class PrefetchTests(unittest.TestCase):
+    """
+    Прямые тесты TtsPlaybackWorker: синтез следующей реплики должен идти
+    параллельно с воспроизведением текущей (см. _speak/_start_prefetch в
+    workers.py), а не добавляться к задержке каждой реплики по очереди.
+    """
+
+    def _run_worker(self, first_item, second_item, synth_seconds, play_seconds,
+                     second_item_delay, join_timeout=10.0):
+        """
+        Кладёт ``first_item`` в очередь сразу, запускает воркер, затем —
+        отдельным потоком, с задержкой ``second_item_delay`` — кладёт
+        ``second_item`` (как в реальности: OCR распознаёт следующую реплику
+        уже ПОСЛЕ того, как первая начала обрабатываться, не раньше).
+        """
+        shared = SharedSettings(config.Settings())
+        bus = EventBus()
+        speech_queue: "queue.Queue[SpeechItem]" = queue.Queue(maxsize=config.MAX_TTS_QUEUE)
+        speech_queue.put_nowait(first_item)
+        stop_event = threading.Event()
+        tts = _TimedFakeTts(synth_seconds)
+        player = _TimedFakePlayer(play_seconds)
+        worker = TtsPlaybackWorker(shared, bus, speech_queue, stop_event, tts, player)
+
+        def deliver_second_item():
+            time.sleep(second_item_delay)
+            speech_queue.put_nowait(second_item)
+
+        threading.Thread(target=deliver_second_item, daemon=True).start()
+        worker.start()
+        deadline = time.monotonic() + join_timeout
+        while len(player.play_started_at) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        stop_event.set()
+        worker.join(timeout=5.0)
+        return tts, player
+
+    def test_second_item_synthesis_overlaps_first_item_playback(self):
+        # Синтез — 0.3 c, воспроизведение — 0.6 c (дольше синтеза, так что
+        # синтез второй реплики успевает полностью завершиться на фоне
+        # воспроизведения первой). Вторая реплика «распознаётся» (попадает в
+        # очередь) через 0.1 c после старта — пока первая ещё синтезируется
+        # или уже звучит, как и в реальном конвейере (OcrWorker кладёт в
+        # очередь следующую фразу, пока TtsPlaybackWorker занят предыдущей).
+        # Без упреждающего синтеза время между началом воспроизведения первой
+        # и второй реплики было бы не меньше play1 + synth2 ≈ 0.9 c; с
+        # упреждением — близко к одному только play1 ≈ 0.6 c (плюс небольшая
+        # пауза SAME_AREA_GAP).
+        first = SpeechItem(area=0, text="Первая реплика", created_at=time.monotonic())
+        second = SpeechItem(area=0, text="Вторая реплика", created_at=time.monotonic())
+        tts, player = self._run_worker(
+            first, second, synth_seconds=0.3, play_seconds=0.6, second_item_delay=0.1,
+        )
+
+        self.assertEqual(len(player.play_started_at), 2, "обе реплики должны были прозвучать")
+        self.assertEqual(tts.synthesize_calls, ["Первая реплика", "Вторая реплика"])
+
+        gap = player.play_started_at[1] - player.play_started_at[0]
+        # play_seconds (0.6) + SAME_AREA_GAP_SECONDS (0.15) ≈ 0.75 — даём
+        # разумный запас сверху на накладные расходы потоков и busy-wait
+        # опроса в _run_worker, но решающая проверка — ниже: что синтез НЕ
+        # добавился поверх этого целиком (иначе было бы ближе к 0.3+0.6=0.9+).
+        self.assertLess(
+            gap, 0.85,
+            f"вторая реплика началась через {gap:.3f} c после первой — "
+            "синтез, похоже, не перекрывался с воспроизведением",
+        )
+
+    def test_without_overlap_would_be_slower_reference(self):
+        # Контрольное измерение той же сценки без TtsPlaybackWorker вообще —
+        # просто синтез и воспроизведение одно за другим, как это было ДО
+        # добавления упреждающего синтеза. Подтверждает, что тестовые тайминги
+        # (synth_seconds, play_seconds) в этом файле вообще способны отличить
+        # «перекрывается» от «не перекрывается», а не совпадают в обоих случаях
+        # по случайности выбранных чисел.
+        tts = _TimedFakeTts(0.3)
+        player = _TimedFakePlayer(0.6)
+        started = time.monotonic()
+        for text in ("Первая реплика", "Вторая реплика"):
+            tts.synthesize(text, "aidar", 1.0)
+            player.play(np.zeros(8, dtype=np.float32))
+        total = time.monotonic() - started
+        self.assertGreaterEqual(total, 0.3 + 0.6 + 0.3 + 0.6 - 0.05)
 
 
 class SpeakingEventsIntegrationTests(unittest.TestCase):

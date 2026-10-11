@@ -187,6 +187,11 @@ DEFAULT_AREA_PAUSE = 1.0
 MAX_AREA_PAUSE = 5.0
 SAME_AREA_GAP_SECONDS = 0.15
 
+# Прозрачность рамки области, пока она не читается вслух (настраивается в окне
+# ползунком «Прозрачность рамки»; 0.0 — рамка не видна, 1.0 — непрозрачна).
+# Значение по умолчанию совпадает с прежней фиксированной overlay.IDLE_ALPHA.
+DEFAULT_OVERLAY_ALPHA = 0.30
+
 # Версия формата файла настроек (нужна для переноса старых настроек).
 SETTINGS_VERSION = 2
 
@@ -210,6 +215,11 @@ class Settings:
     # Пауза (секунды) между репликами из разных областей.
     area_pause: float = DEFAULT_AREA_PAUSE
     overlay_visible: bool = True
+    # Прозрачность рамки области вне момента озвучки: 0.0 — рамка совсем не
+    # видна (но её по-прежнему можно найти и подвинуть, см. overlay.py),
+    # 1.0 — полностью непрозрачная. Значение по умолчанию совпадает с
+    # overlay.IDLE_ALPHA, которая была до появления этой настройки.
+    overlay_alpha: float = DEFAULT_OVERLAY_ALPHA
 
     # -- сохранение / загрузка -------------------------------------------------
 
@@ -281,6 +291,7 @@ class Settings:
             _to_float(self.capture_fps, DEFAULT_CAPTURE_FPS), MIN_CAPTURE_FPS, MAX_CAPTURE_FPS
         )
         self.area_pause = _clamp(_to_float(self.area_pause, DEFAULT_AREA_PAUSE), 0.0, MAX_AREA_PAUSE)
+        self.overlay_alpha = _clamp(_to_float(self.overlay_alpha, DEFAULT_OVERLAY_ALPHA), 0.0, 1.0)
         self.similarity_threshold = int(
             _clamp(_to_float(self.similarity_threshold, SIMILARITY_THRESHOLD), 50, 100)
         )

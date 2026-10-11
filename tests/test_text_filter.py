@@ -33,6 +33,24 @@ class CleanTextTests(unittest.TestCase):
         self.assertEqual(clean_text(""), "")
         self.assertEqual(clean_text("   "), "")
 
+    def test_drops_glued_together_ocr_garbage(self):
+        # Реальный пример из журнала пользователя: несколько слов субтитра,
+        # которые OCR слепил в одно без единого пробела, — такую «кашу»
+        # Silero озвучил бы неразборчивым набором звуков.
+        self.assertEqual(clean_text("почемубьтебененрисестьменадолго"), "")
+
+    def test_keeps_long_real_russian_word(self):
+        # Самые длинные настоящие русские слова не должны задеваться
+        # порогом _MAX_SINGLE_WORD_LETTERS, рассчитанным на то, чтобы ловить
+        # именно склейку НЕСКОЛЬКИХ слов, а не редкое длинное слово.
+        self.assertEqual(clean_text("человеконенавистничество"), "человеконенавистничество")
+
+    def test_keeps_natural_phrase_with_many_short_words(self):
+        # Диалоговые фразы с обилием коротких местоимений и союзов —
+        # обычное дело в субтитрах и не должны ложно приниматься за мусор.
+        text = "Он и она, ты и я, мы и они — вот и всё, что есть у нас"
+        self.assertEqual(clean_text(text), text)
+
 
 class SimilarityTests(unittest.TestCase):
     def test_same_text_with_punctuation_is_identical(self):

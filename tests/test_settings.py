@@ -38,7 +38,7 @@ class SettingsTests(unittest.TestCase):
             path = Path(folder) / "settings.json"
             path.write_text(
                 '{"settings_version": 2, "speed": 99, "volume": -5, "capture_fps": 100, '
-                '"speaker": "нет_такого", "rois": [[1, 2]], "area_pause": 99}',
+                '"speaker": "нет_такого", "rois": [[1, 2]], "area_pause": 99, "overlay_alpha": 5}',
                 encoding="utf-8",
             )
             loaded = config.Settings.load(path)
@@ -46,9 +46,30 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(loaded.volume, 0.0)
             self.assertEqual(loaded.capture_fps, config.MAX_CAPTURE_FPS)
             self.assertEqual(loaded.area_pause, config.MAX_AREA_PAUSE)
+            self.assertEqual(loaded.overlay_alpha, 1.0)
             self.assertEqual(loaded.speaker, config.DEFAULT_SPEAKER)
             self.assertEqual(len(loaded.rois), 1)          # неверная область заменена областью по умолчанию
             self.assertEqual(len(loaded.rois[0]), 4)
+
+    def test_overlay_alpha_negative_is_clamped_to_zero(self):
+        # Отдельно от общего теста выше: 0.0 — это ЗНАЧИМОЕ, а не дефолтное
+        # значение (рамка полностью не видна), поэтому важно явно проверить,
+        # что отрицательное входное значение становится именно 0.0, а не
+        # случайно откатывается к DEFAULT_OVERLAY_ALPHA где-нибудь по пути.
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "settings.json"
+            path.write_text('{"overlay_alpha": -1}', encoding="utf-8")
+            self.assertEqual(config.Settings.load(path).overlay_alpha, 0.0)
+
+    def test_overlay_alpha_missing_from_an_older_settings_file_gets_the_default(self):
+        # Файл настроек, сохранённый ДО появления этой настройки, не содержит
+        # "overlay_alpha" вовсе — загрузка не должна падать, а должна молча
+        # подставить значение по умолчанию (прежнюю фиксированную прозрачность).
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "settings.json"
+            path.write_text('{"settings_version": 2, "speed": 1.2}', encoding="utf-8")
+            loaded = config.Settings.load(path)
+            self.assertEqual(loaded.overlay_alpha, config.DEFAULT_OVERLAY_ALPHA)
 
     def test_unknown_fields_are_ignored(self):
         with tempfile.TemporaryDirectory() as folder:

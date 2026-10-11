@@ -28,6 +28,10 @@
 Потоки общаются через thread-safe очереди и события. Любые сообщения для
 интерфейса отправляются в очередь событий, а GUI сам забирает их в своём
 потоке — так окно никогда не зависает и не вызывается из чужих потоков.
+
+Поток снимков перед каждым снимком экрана может (через OverlayCaptureGate)
+попросить GUI на мгновение спрятать окна рамок — иначе рамка и её подпись
+попадают в кадр, который видит OCR, и распознаются как часть субтитров.
 """
 
 import copy
@@ -92,6 +96,132 @@ class EventBus:
             except queue.Empty:
                 break
         return events
+
+
+# ---------------------------------------------------------------------------
+# Синхронное скрытие рамок на время снимка (чтобы OCR не читал саму рамку)
+# ---------------------------------------------------------------------------
+
+class OverlayCaptureGate:
+    """
+    Мост между потоком снимков (CaptureWorker, фоновый поток) и окнами рамок
+    (SelectionOverlay, живут только в главном потоке Tk) — безопасно просит
+    главный поток на мгновение убрать все рамки с экрана перед снимком и
+    вернуть их обратно сразу после, не трогая сами окна из чужого потока.
+
+    Зачем это нужно. SelectionOverlay уже пытается исключить себя из захвата
+    средствами Windows (см. overlay._exclude_from_capture), но этот способ
+    опирается на то, что сам захват экрана поддерживает такое исключение, —
+    а mss снимает экран через GDI/BitBlt, и на части систем (видеокарта,
+    драйвер, сборка Windows) это исключение для таких снимков не действует.
+    Тогда в кадр, который видит OCR, попадает контур рамки и её подпись
+    («Область субтитров N — перетащите, тяните за угол»), и распознавание
+    читает эту надпись вместо (или вместе с) субтитров игры.
+
+    Единственный способ, который работает всегда и везде, — физически убрать
+    окно рамки с экрана (withdraw) на время самого снимка и сразу показать
+    обратно. Это и делает этот класс, синхронно:
+
+        gate.request_hide()   # из CaptureWorker, ждёт, пока GUI спрячет рамки
+        image = capture.grab(roi)
+        gate.request_show()   # из CaptureWorker, не ждёт — показ не обязан
+                               # блокировать следующий снимок
+
+    GUI со своей стороны регистрируется один раз при старте слежения
+    (см. MainWindow._install_capture_gate) и снимает регистрацию при
+    остановке — после этого gate ничего не ждёт и методы мгновенно
+    возвращаются (чтобы ошибка в GUI или его закрытие не подвесили поток
+    снимков навсегда).
+    """
+
+    # Сколько ждать ответа от GUI на один запрос. GUI опрашивает этот мост
+    # каждые OVERLAY_GATE_POLL_MS миллисекунд (см. gui.py), поэтому реальное
+    # время отклика обычно куда меньше этого потолка; таймаут — только защита
+    # от зависшего или перегруженного интерфейса, чтобы поток снимков не
+    # застрял навсегда и в худшем случае просто снял кадр с видимой рамкой.
+    _RESPONSE_TIMEOUT_S = 0.25
+
+    def __init__(self) -> None:
+        self._hide_fn: Optional[Callable[[], None]] = None
+        self._show_fn: Optional[Callable[[], None]] = None
+        self._request = threading.Event()
+        self._done = threading.Event()
+        self._pending_show = False
+        self._lock = threading.Lock()
+
+    def install(self, hide_fn: Callable[[], None], show_fn: Callable[[], None]) -> None:
+        """Регистрирует GUI-колбэки (вызывается из главного потока при старте)."""
+        with self._lock:
+            self._hide_fn = hide_fn
+            self._show_fn = show_fn
+            self._pending_show = False
+            self._done.clear()
+            self._request.clear()
+
+    def uninstall(self) -> None:
+        """Снимает регистрацию (вызывается из главного потока при остановке)."""
+        with self._lock:
+            self._hide_fn = None
+            self._show_fn = None
+            self._request.clear()
+            self._done.set()   # любой, кто сейчас ждёт — не должен зависнуть навсегда
+
+    def request_hide(self) -> bool:
+        """
+        Просит GUI спрятать рамки и ждёт подтверждения (вызывается из
+        CaptureWorker). Возвращает True, если GUI подтвердил скрытие вовремя —
+        тогда после снимка обязательно нужно вызвать request_show().
+        Если GUI не зарегистрирован (слежение ещё не запущено через окно,
+        например в тестах) или не успел ответить за _RESPONSE_TIMEOUT_S —
+        возвращает False и ничего не блокирует: снимок будет сделан с рамкой
+        как есть, лучше так, чем подвесить поток снимков насовсем.
+        """
+        with self._lock:
+            if self._hide_fn is None:
+                return False
+            self._pending_show = False
+            self._done.clear()
+            self._request.set()
+        confirmed = self._done.wait(self._RESPONSE_TIMEOUT_S)
+        return confirmed and self._hide_fn is not None
+
+    def request_show(self) -> None:
+        """
+        Просит GUI вернуть рамки на экран (вызывается из CaptureWorker сразу
+        после снимка, если request_hide() вернул True). Не ждёт ответа — пока
+        рамка возвращается на экран, следующий снимок делать уже можно, показ
+        не обязан его блокировать.
+        """
+        with self._lock:
+            if self._show_fn is None:
+                return
+            self._pending_show = True
+            self._request.set()
+
+    # -- вызывается из главного потока (GUI) ---------------------------------
+
+    def poll(self) -> None:
+        """
+        Выполняет накопившийся запрос, если он есть (вызывается из главного
+        потока Tk коротким таймером, см. gui.py). Сам решает, спрятать рамки
+        или показать — приоритет у более позднего запроса: если за один тик
+        накопились и hide, и show, выполняется только последний (show), а
+        не оба подряд — это по-прежнему корректно, потому что CaptureWorker
+        уже получил бы confirmed=False и снял бы кадр с видимой рамкой.
+        """
+        with self._lock:
+            if not self._request.is_set():
+                return
+            self._request.clear()
+            pending_show = self._pending_show
+            hide_fn, show_fn = self._hide_fn, self._show_fn
+        if pending_show:
+            if show_fn is not None:
+                show_fn()
+        else:
+            if hide_fn is not None:
+                hide_fn()
+            self._done.set()
 
 
 # ---------------------------------------------------------------------------
@@ -302,11 +432,33 @@ class CaptureWorker(_LoopWorker):
         buffer: FrameBuffer,
         stop_event: threading.Event,
         capture_factory: Callable[[], ScreenCapture] = ScreenCapture,
+        overlay_gate: Optional[OverlayCaptureGate] = None,
     ) -> None:
         super().__init__("CaptureWorker", bus, stop_event)
         self._shared = shared
         self._buffer = buffer
         self._capture_factory = capture_factory
+        # Необязателен: NeuroVoxEngine без окна (preview_recognition, тесты)
+        # просто не передаёт его, и снимки делаются как раньше, без скрытия
+        # рамки, — на уровне окна этот способ и не нужен (рамки нет вовсе).
+        self._overlay_gate = overlay_gate
+
+    def _grab_area(self, capture: ScreenCapture, roi) -> np.ndarray:
+        """
+        Снимает одну область, на время самого снимка пряча рамки через
+        overlay_gate (если он установлен и GUI сейчас его обслуживает) — см.
+        OverlayCaptureGate выше. Рамка возвращается на экран сразу после
+        снимка, независимо от того, успешен он был или бросил исключение.
+        """
+        gate = self._overlay_gate
+        if gate is None:
+            return capture.grab(roi)
+        hidden = gate.request_hide()
+        try:
+            return capture.grab(roi)
+        finally:
+            if hidden:
+                gate.request_show()
 
     def run(self) -> None:
         # mss нужно создавать именно в том потоке, где он используется.
@@ -336,7 +488,7 @@ class CaptureWorker(_LoopWorker):
                 now = time.monotonic()
                 for index, roi in enumerate(rois):
                     try:
-                        image = preprocess_for_ocr(capture.grab(tuple(roi)))
+                        image = preprocess_for_ocr(self._grab_area(capture, tuple(roi)))
                     except CaptureError as exc:
                         failure = str(exc)
                         continue
@@ -552,8 +704,19 @@ class TtsPlaybackWorker(threading.Thread):
 
     Реплики читаются строго по очереди — две не звучат одновременно. Между репликами
     из разных областей выдерживается пауза ``area_pause``, между репликами одной
-    области — короткая пауза. Пока играет одна реплика, следующая ждёт в очереди; её
-    синтез идёт до паузы, чтобы пауза не растягивалась на время синтеза.
+    области — короткая пауза.
+
+    Синтез следующей реплики готовится ЗАРАНЕЕ, в отдельном потоке, пока звучит
+    текущая (см. _prefetch): синтез речи на CPU без видеокарты занимает заметное
+    время — не миллисекунды, а иногда больше секунды на фразу, — и раньше это время
+    целиком добавлялось к задержке каждой реплики (сначала синтез, потом пауза,
+    потом воспроизведение, одно за другим). Теперь, пока играет реплика N, уже идёт
+    синтез реплики N+1 — и к моменту, когда реплика N доиграна, озвучка реплики N+1
+    чаще всего уже готова и остаётся только выдержать паузу и начать её сразу,
+    вместо того чтобы ждать ещё и синтез в придачу. skip_stale_duplicates
+    по-прежнему применяется к реплике непосредственно перед тем, как она реально
+    синтезируется, поэтому упреждающий синтез не озвучивает то, что должно быть
+    пропущено как устаревшее.
     """
 
     def __init__(
@@ -574,37 +737,144 @@ class TtsPlaybackWorker(threading.Thread):
         self._player = player
         self._last_area: Optional[int] = None
         self._last_finished: float = 0.0
+        self._prefetch_thread: Optional[threading.Thread] = None
+        self._prefetch_result: "Optional[List[Optional[_PreparedSpeech]]]" = None
 
     def run(self) -> None:
         logger.info("Поток озвучки запущен.")
+        pending: Optional[_PreparedSpeech] = None
         try:
             while not self._stop_event.is_set():
-                try:
-                    item = self._speech_queue.get(timeout=0.2)
-                except queue.Empty:
-                    continue
+                if pending is not None:
+                    # Это результат упреждающего синтеза (_start_prefetch), который
+                    # готовился, пока звучала ПРЕДЫДУЩАЯ реплика — за то время, что
+                    # он ждал своей очереди здесь, для его области могла прийти ещё
+                    # более новая реплика, и её нужно поймать именно сейчас, перед
+                    # тем как её озвучить (см. docstring класса). Для реплики,
+                    # которая только что получена через _fetch_and_prepare ниже,
+                    # эта проверка уже была сделана ВНУТРИ неё — повторять её здесь
+                    # не только лишне, но и неверно: такая реплика ещё ни разу не
+                    # звучала, и более новая реплика той же области, появившаяся
+                    # в очереди прямо во время её первого синтеза, пришла едва ли
+                    # на мгновение позже — это не «отставание», а обычный порядок
+                    # появления субтитров, и первую реплику в этом случае нужно
+                    # всё равно озвучить, а не пропустить как устаревшую.
+                    prepared = pending
+                    pending = None
+                    item, skipped = skip_stale_duplicates(self._speech_queue, prepared.item)
+                    if skipped:
+                        self._announce_skip(item, skipped)
+                        prepared = self._resynthesize_if_item_changed(prepared, item)
+                    if prepared is None or self._is_too_old(item):
+                        if prepared is None:
+                            logger.info("Реплика устарела и пропущена: %s", item.text)
+                        continue
+                else:
+                    prepared = self._fetch_and_prepare(block=True)
+                    if prepared is None:
+                        continue   # таймаут ожидания (_stop_event мог быть выставлен) — проверяем цикл заново
 
-                # Пока эта реплика ждала своей очереди, для её области могла прийти
-                # более новая — тогда сразу переходим к ней (см. skip_stale_duplicates).
-                item, skipped = skip_stale_duplicates(self._speech_queue, item)
-                if skipped:
-                    area_count = len(self._shared.snapshot().rois)
-                    label = f"Область {item.area + 1}: " if area_count > 1 else ""
-                    message = (
-                        f"{label}пропущено устаревших реплик: {skipped} — "
-                        f"озвучиваем актуальную: {item.text}"
-                    )
-                    logger.info(message)
-                    self._bus.emit("skipped", message)
+                self._speak(prepared)
 
-                # Реплика, простоявшая в очереди слишком долго, в игре уже неактуальна.
-                if time.monotonic() - item.created_at > config.MAX_PHRASE_AGE_SECONDS:
-                    logger.info("Реплика устарела и пропущена: %s", item.text)
-                    continue
-                self._speak(item)
+                # Синтез следующей реплики начинается сразу после того, как текущая
+                # начала играть (внутри _speak, в фоновом потоке) — к этому моменту
+                # он уже должен был завершиться или вот-вот завершится.
+                pending = self._collect_prefetch()
         finally:
             self._player.stop()
             logger.info("Поток озвучки остановлен.")
+
+    # -- подготовка (синтез) реплик, с упреждением ---------------------------
+
+    def _fetch_and_prepare(self, block: bool) -> "Optional[_PreparedSpeech]":
+        """Достаёт одну реплику из очереди и сразу синтезирует её (без упреждения)."""
+        try:
+            item = self._speech_queue.get(timeout=0.2) if block else self._speech_queue.get_nowait()
+        except queue.Empty:
+            return None
+        item, skipped = skip_stale_duplicates(self._speech_queue, item)
+        if skipped:
+            self._announce_skip(item, skipped)
+        if self._is_too_old(item):
+            logger.info("Реплика устарела и пропущена: %s", item.text)
+            return None
+        return self._synthesize(item)
+
+    def _is_too_old(self, item: SpeechItem) -> bool:
+        return time.monotonic() - item.created_at > config.MAX_PHRASE_AGE_SECONDS
+
+    def _announce_skip(self, item: SpeechItem, skipped: int) -> None:
+        area_count = len(self._shared.snapshot().rois)
+        label = f"Область {item.area + 1}: " if area_count > 1 else ""
+        message = f"{label}пропущено устаревших реплик: {skipped} — озвучиваем актуальную: {item.text}"
+        logger.info(message)
+        self._bus.emit("skipped", message)
+
+    def _synthesize(self, item: SpeechItem) -> "Optional[_PreparedSpeech]":
+        settings = self._shared.snapshot()
+        try:
+            started = time.perf_counter()
+            fragments = self._tts.synthesize(item.text, settings.speaker, settings.speed)
+        except TtsError as exc:
+            logger.error("Ошибка озвучки: %s", exc)
+            self._bus.emit("error", str(exc))
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Непредвиденная ошибка озвучки")
+            self._bus.emit("error", f"Непредвиденная ошибка озвучки: {exc}")
+            return None
+        if not fragments:
+            return None
+        return _PreparedSpeech(item=item, fragments=fragments, synth_seconds=time.perf_counter() - started)
+
+    def _resynthesize_if_item_changed(
+        self, prepared: "_PreparedSpeech", item: SpeechItem
+    ) -> "Optional[_PreparedSpeech]":
+        """
+        Если skip_stale_duplicates заменил реплику на более свежую, то, что было
+        синтезировано заранее (для старой реплики), больше не годится — нужно
+        синтезировать актуальный текст. Если же реплика не изменилась, уже
+        готовый результат используется как есть (без повторного синтеза).
+        """
+        if item is prepared.item:
+            return prepared
+        return self._synthesize(item)
+
+    def _start_prefetch(self) -> None:
+        """
+        Запускает в фоновом потоке подготовку следующей реплики (взятие из
+        очереди + синтез), пока текущая реплика звучит в этом потоке. Если
+        очередь сейчас пуста, фоновый поток недолго подождёт (timeout у
+        _speech_queue.get) и тихо завершится с результатом None — это не
+        ошибка, а обычный случай, когда субтитры идут неторопливо и новая
+        реплика ещё не появилась.
+        """
+        result: "List[Optional[_PreparedSpeech]]" = [None]
+
+        def worker() -> None:
+            result[0] = self._fetch_and_prepare(block=True)
+
+        thread = threading.Thread(target=worker, name="TtsPrefetch", daemon=True)
+        thread.start()
+        self._prefetch_thread = thread
+        self._prefetch_result = result
+
+    def _collect_prefetch(self) -> "Optional[_PreparedSpeech]":
+        """
+        Дожидается завершения фоновой подготовки, запущенной _start_prefetch,
+        и возвращает её результат (None, если очередь была пуста всё это время
+        или остановка программы прервала ожидание).
+        """
+        thread = self._prefetch_thread
+        if thread is None:
+            return None
+        thread.join()
+        result = self._prefetch_result[0]
+        self._prefetch_thread = None
+        self._prefetch_result = None
+        return result
+
+    # -- воспроизведение ------------------------------------------------------
 
     def _wait_turn(self, area: int, area_pause: float) -> None:
         """Выдерживает паузу после предыдущей реплики (дольше — при смене области)."""
@@ -615,36 +885,40 @@ class TtsPlaybackWorker(threading.Thread):
         if remaining > 0:
             self._stop_event.wait(remaining)
 
-    def _speak(self, item: SpeechItem) -> None:
+    def _speak(self, prepared: "_PreparedSpeech") -> None:
+        item, fragments = prepared.item, prepared.fragments
         settings = self._shared.snapshot()
+        self._bus.emit("spoken", item.text, prepared.synth_seconds)
+        self._wait_turn(item.area, settings.area_pause)
+        # Синтез следующей реплики запускается прямо сейчас, в фоновом потоке,
+        # — до начала паузы и воспроизведения этой, чтобы он шёл параллельно с
+        # ними, а не добавлялся к задержке после. _collect_prefetch() в run()
+        # дожидается его результата уже после того, как эта реплика доиграна.
+        self._start_prefetch()
+        # "speaking_start"/"speaking_end" обрамляют именно звучание, а не синтез и
+        # не паузу перед ним — интерфейс использует их, чтобы на это время прятать
+        # рамку области (см. SelectionOverlay.set_reading). finally гарантирует
+        # парный "speaking_end" и при обычном завершении, и при ранней остановке
+        # (_stop_event), и если воспроизведение само бросит исключение.
+        self._bus.emit("speaking_start", value=float(item.area))
         try:
-            started = time.perf_counter()
-            fragments = self._tts.synthesize(item.text, settings.speaker, settings.speed)
-            if not fragments:
-                return
-            self._bus.emit("spoken", item.text, time.perf_counter() - started)
-            self._wait_turn(item.area, settings.area_pause)
-            # "speaking_start"/"speaking_end" обрамляют именно звучание, а не синтез и
-            # не паузу перед ним — интерфейс использует их, чтобы на это время прятать
-            # рамку области (см. SelectionOverlay.set_reading). finally гарантирует
-            # парный "speaking_end" и при обычном завершении, и при ранней остановке
-            # (_stop_event), и если воспроизведение само бросит исключение.
-            self._bus.emit("speaking_start", value=float(item.area))
-            try:
-                for fragment in fragments:
-                    if self._stop_event.is_set():
-                        return
-                    self._player.play(fragment, settings.volume)
-            finally:
-                self._bus.emit("speaking_end", value=float(item.area))
-            self._last_area = item.area
-            self._last_finished = time.monotonic()
-        except TtsError as exc:
-            logger.error("Ошибка озвучки: %s", exc)
-            self._bus.emit("error", str(exc))
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Непредвиденная ошибка озвучки")
-            self._bus.emit("error", f"Непредвиденная ошибка озвучки: {exc}")
+            for fragment in fragments:
+                if self._stop_event.is_set():
+                    return
+                self._player.play(fragment, settings.volume)
+        finally:
+            self._bus.emit("speaking_end", value=float(item.area))
+        self._last_area = item.area
+        self._last_finished = time.monotonic()
+
+
+@dataclass
+class _PreparedSpeech:
+    """Реплика, для которой синтез речи уже выполнен и ждёт своей очереди на воспроизведение."""
+
+    item: SpeechItem
+    fragments: List[np.ndarray]
+    synth_seconds: float
 
 
 # ---------------------------------------------------------------------------
@@ -664,6 +938,7 @@ class NeuroVoxEngine:
         shared: SharedSettings,
         bus: EventBus,
         capture_factory: Callable[[], ScreenCapture] = ScreenCapture,
+        overlay_gate: Optional[OverlayCaptureGate] = None,
     ) -> None:
         self._shared = shared
         self._bus = bus
@@ -683,6 +958,11 @@ class NeuroVoxEngine:
         # preview_recognition, единственное место, где NeuroVoxEngine сам
         # создаёт ScreenCapture — CaptureWorker строит собственный).
         self._capture_factory = capture_factory
+        # Мост к окнам рамок (см. OverlayCaptureGate выше) — передаётся из
+        # MainWindow, чтобы CaptureWorker мог на время снимка прятать рамки,
+        # не трогая их окна напрямую из чужого потока. Без окна (тесты,
+        # preview_recognition) остаётся None — снимки делаются как раньше.
+        self._overlay_gate = overlay_gate
 
     @property
     def is_running(self) -> bool:
@@ -741,7 +1021,10 @@ class NeuroVoxEngine:
 
         self._speech_queue = queue.Queue(maxsize=config.MAX_TTS_QUEUE)
         self._buffer = FrameBuffer()
-        capture_thread = CaptureWorker(self._shared, self._bus, self._buffer, self._stop_event)
+        capture_thread = CaptureWorker(
+            self._shared, self._bus, self._buffer, self._stop_event,
+            overlay_gate=self._overlay_gate,
+        )
         ocr_thread = OcrWorker(
             self._shared, self._bus, self._buffer, self._speech_queue, self._stop_event, self._ocr
         )
