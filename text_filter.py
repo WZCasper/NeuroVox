@@ -17,6 +17,7 @@ from typing import Optional
 from rapidfuzz import fuzz
 
 import config
+from pronunciation import SpeakerNameList
 
 logger = logging.getLogger("neurovox.filter")
 
@@ -48,6 +49,49 @@ _LATIN_TO_CYR = str.maketrans(
 _CYRILLIC = re.compile(r"[А-Яа-яЁё]")
 _LATIN = re.compile(r"[A-Za-z]")
 _WORD = re.compile(r"[A-Za-zА-Яа-яЁё]+")
+
+# Имя говорящего в начале реплики: «Хозия: Несите его сюда!» или «Датч — Ты нам
+# нужен сильным.» — 1-2 слова с заглавной буквы (имя, и, возможно, фамилия или
+# прозвище), сразу (без пробела перед ним) двоеточие или тире, затем пробел и
+# сам текст реплики. Длина слова (2-15 букв) отсекает как однобуквенные
+# артефакты OCR, так и маловероятно длинные «имена» (которые на деле почти
+# наверняка не имя, а начало обычного предложения).
+_SPEAKER_PREFIX = re.compile(
+    r"^([A-ZА-ЯЁ][a-zа-яё]{1,14}(?:\s[A-ZА-ЯЁ][a-zа-яё]{1,14})?)\s*[:—-]\s+(?=\S)"
+)
+
+
+def strip_speaker_name(text: str, mode: str, names: Optional[SpeakerNameList] = None) -> str:
+    """
+    Убирает имя говорящего из начала реплики, если оно там есть.
+
+    mode:
+      "off"  — текст не трогается (по умолчанию).
+      "auto" — убирается ЛЮБОЙ текст, похожий на имя по форме (см.
+               _SPEAKER_PREFIX): 1-2 слова с заглавной буквы перед «:» или
+               «—»/«-» в начале строки. Это не всегда верно отличает имя от
+               обычного вводного слова фразы («Запомни: ...») — пользователь
+               сам выбирает этот режим, зная о таком риске (см. config.py,
+               где объясняется разница между "auto" и "list").
+      "list" — убирается, только если текст перед разделителем совпадает (без
+               учёта регистра) с одним из имён в ``names``. Требует ``names``;
+               без него (или с пустым списком) ничего не убирается.
+
+    Если текст не начинается с подходящего по форме префикса вообще, возвращает
+    его без изменений, независимо от режима.
+    """
+    if mode == "off" or not text:
+        return text
+    match = _SPEAKER_PREFIX.match(text)
+    if not match:
+        return text
+    candidate = match.group(1)
+    if mode == "list":
+        if names is None or not names.contains(candidate):
+            return text
+    elif mode != "auto":
+        return text
+    return text[match.end():]
 
 
 def _fix_mixed_alphabet(text: str) -> str:
@@ -85,8 +129,18 @@ def _looks_like_ocr_garbage(text: str) -> bool:
     return any(len(word) > _MAX_SINGLE_WORD_LETTERS for word in words)
 
 
-def clean_text(raw: str) -> str:
-    """Очищает распознанную строку. Возвращает пустую строку, если речи нет."""
+def clean_text(
+    raw: str,
+    speaker_name_mode: str = "off",
+    speaker_names: Optional[SpeakerNameList] = None,
+) -> str:
+    """
+    Очищает распознанную строку. Возвращает пустую строку, если речи нет.
+
+    speaker_name_mode и speaker_names — см. strip_speaker_name ниже; по
+    умолчанию отсечение имени выключено ("off"), поэтому вызовы без этих
+    аргументов ведут себя как раньше.
+    """
     if not raw:
         return ""
 
@@ -96,6 +150,11 @@ def clean_text(raw: str) -> str:
     text = _fix_mixed_alphabet(text)
     text = _SPACES.sub(" ", text).strip()
     text = _EDGE_JUNK.sub("", text).strip()
+    # Имя говорящего убирается ДО остальных проверок длины/мусора ниже, чтобы
+    # короткая реплика после имени («Датч: Нет.») не отбраковывалась как
+    # слишком короткая из-за того, что само имя считалось частью длины.
+    text = strip_speaker_name(text, speaker_name_mode, speaker_names)
+    text = text.strip()
 
     if len(text) < config.MIN_TEXT_LENGTH:
         return ""
@@ -148,9 +207,17 @@ class SubtitleFilter:
         self,
         threshold: int = config.SIMILARITY_THRESHOLD,
         stable_frames: int = config.STABLE_FRAMES_REQUIRED,
+        speaker_name_mode: str = "off",
+        speaker_names: Optional[SpeakerNameList] = None,
     ) -> None:
         self.threshold = threshold
         self.stable_frames = max(1, stable_frames)
+        # См. strip_speaker_name/clean_text — режим и список можно менять «на
+        # лету» (как и threshold выше): OcrWorker.run перечитывает настройки
+        # каждый цикл и присваивает их атрибутам существующего фильтра, а не
+        # создаёт SubtitleFilter заново.
+        self.speaker_name_mode = speaker_name_mode
+        self.speaker_names = speaker_names
         self._last_spoken: str = ""
         self._candidate: str = ""
         self._candidate_count: int = 0
@@ -199,7 +266,7 @@ class SubtitleFilter:
 
         Возвращает очищенный текст, если его нужно озвучить, иначе None.
         """
-        text = clean_text(raw_text)
+        text = clean_text(raw_text, self.speaker_name_mode, self.speaker_names)
         if not text:
             self._candidate = ""
             self._candidate_count = 0

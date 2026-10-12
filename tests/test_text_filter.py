@@ -7,7 +7,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from text_filter import SubtitleFilter, clean_text, similarity  # noqa: E402
+from pronunciation import SpeakerNameList  # noqa: E402
+from text_filter import SubtitleFilter, clean_text, strip_speaker_name, similarity  # noqa: E402
 
 
 class CleanTextTests(unittest.TestCase):
@@ -149,6 +150,95 @@ class SettledFrameTests(unittest.TestCase):
         self.assertIsNone(flt.process("Беги отсюда", settled=True))
         flt.forget()
         self.assertEqual(flt.process("Беги отсюда", settled=True), "Беги отсюда")
+
+
+class StripSpeakerNameTests(unittest.TestCase):
+    """
+    strip_speaker_name() и его интеграция в clean_text() — отсечение имени
+    говорящего в начале реплики («Хозия: Несите его сюда!»), см. docstring
+    strip_speaker_name в text_filter.py и config.SPEAKER_NAME_MODES.
+    """
+
+    def test_off_mode_does_not_touch_text(self):
+        self.assertEqual(strip_speaker_name("Хозия: Несите его сюда!", "off"), "Хозия: Несите его сюда!")
+
+    def test_auto_mode_strips_a_name_before_colon(self):
+        self.assertEqual(strip_speaker_name("Хозия: Несите его сюда!", "auto"), "Несите его сюда!")
+
+    def test_auto_mode_strips_a_name_before_dash(self):
+        self.assertEqual(strip_speaker_name("Датч — Ты нам нужен сильным.", "auto"), "Ты нам нужен сильным.")
+
+    def test_auto_mode_strips_a_two_word_name(self):
+        self.assertEqual(
+            strip_speaker_name("Артур Морган: Ладно, идём.", "auto"), "Ладно, идём."
+        )
+
+    def test_auto_mode_also_strips_a_non_name_word_by_the_same_shape(self):
+        # Задокументированный компромисс режима "auto": формально неотличимо
+        # от настоящего имени (см. docstring strip_speaker_name и config.py),
+        # поэтому тест фиксирует это поведение как ожидаемое, а не как баг.
+        self.assertEqual(
+            strip_speaker_name("Запомни: никогда не доверяй чужакам.", "auto"),
+            "никогда не доверяй чужакам.",
+        )
+
+    def test_auto_mode_leaves_text_without_a_name_shaped_prefix_untouched(self):
+        self.assertEqual(strip_speaker_name("Беги, у нас мало времени!", "auto"), "Беги, у нас мало времени!")
+
+    def test_auto_mode_does_not_strip_lowercase_prefix(self):
+        # Имя всегда с заглавной буквы — иначе это не похоже на имя вовсе.
+        self.assertEqual(strip_speaker_name("просто: текст", "auto"), "просто: текст")
+
+    def test_list_mode_strips_a_known_name(self):
+        names = SpeakerNameList(path=None)
+        names._names = {"хозия", "датч"}   # минуя файл — тестируем только логику сравнения
+        self.assertEqual(strip_speaker_name("Хозия: Несите его сюда!", "list", names), "Несите его сюда!")
+
+    def test_list_mode_leaves_an_unknown_name_untouched(self):
+        names = SpeakerNameList(path=None)
+        names._names = {"датч"}
+        self.assertEqual(
+            strip_speaker_name("Запомни: никогда не доверяй чужакам.", "list", names),
+            "Запомни: никогда не доверяй чужакам.",
+        )
+
+    def test_list_mode_without_names_object_does_nothing(self):
+        self.assertEqual(strip_speaker_name("Хозия: Несите его сюда!", "list", None), "Хозия: Несите его сюда!")
+
+    def test_list_mode_name_match_is_case_insensitive(self):
+        # Регистр самого ИМЕНИ в списке не важен (пользователь мог вписать
+        # его строчными буквами) — но первая буква имени В ТЕКСТЕ субтитра
+        # по-прежнему должна быть заглавной, как и пишут имена говорящих на
+        # практике (см. все примеры на скриншотах пользователя); test_auto_
+        # mode_does_not_strip_lowercase_prefix выше фиксирует эту же границу
+        # для режима "auto".
+        # Нормализация регистра имени в самом списке — ответственность
+        # _reload_if_changed() при чтении файла (см. SpeakerNameListFileTests
+        # в этом файле, которые проверяют именно это через реальный файл);
+        # здесь, подменяя _names напрямую в обход файла, кладём уже
+        # нормализованное значение, как это сделал бы реальный путь чтения.
+        names = SpeakerNameList(path=None)
+        names._names = {"хозия"}
+        self.assertEqual(strip_speaker_name("Хозия: Несите его сюда!", "list", names), "Несите его сюда!")
+
+    def test_clean_text_applies_speaker_name_mode(self):
+        self.assertEqual(clean_text("Хозия: Несите его сюда!", "auto"), "Несите его сюда!")
+        self.assertEqual(clean_text("Хозия: Несите его сюда!", "off"), "Хозия: Несите его сюда!")
+
+    def test_clean_text_default_mode_is_off(self):
+        # Вызов без третьего аргумента (как во всех остальных тестах этого
+        # файла) не должен менять поведение, которое было до появления этой
+        # настройки.
+        self.assertEqual(clean_text("Хозия: Несите его сюда!"), "Хозия: Несите его сюда!")
+
+    def test_short_reply_after_name_is_not_dropped_as_too_short(self):
+        # Имя убирается ДО проверки минимальной длины — короткая, но настоящая
+        # реплика после имени («Нет.») не должна отбрасываться как короткая.
+        self.assertEqual(clean_text("Датч: Нет.", "auto"), "Нет.")
+
+    def test_subtitle_filter_uses_speaker_name_mode(self):
+        flt = SubtitleFilter(threshold=85, stable_frames=1, speaker_name_mode="auto")
+        self.assertEqual(flt.process("Хозия: Несите его сюда!", settled=True), "Несите его сюда!")
 
 
 if __name__ == "__main__":

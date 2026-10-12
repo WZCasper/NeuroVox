@@ -60,6 +60,12 @@ SETTINGS_FILE: Path = DATA_DIR / "settings.json"
 # Словарь ударений и произношений: пользователь дописывает туда слова, которые озвучка
 # произносит неверно (имена героев, игровые термины). Читается при каждой фразе.
 STRESS_DICT_FILE: Path = DATA_DIR / "stress_dict.txt"
+# Список имён говорящих для режима «по списку» (см. text_filter.strip_speaker_name):
+# пользователь вписывает туда имена персонажей своей игры («Хозия», «Датч», ...),
+# и текст перед двоеточием/тире в начале реплики озвучивается, только если он не
+# совпадает ни с одним именем из списка. Читается при каждой фразе, как и словарь
+# ударений выше.
+SPEAKER_NAMES_FILE: Path = DATA_DIR / "speaker_names.txt"
 
 # ---------------------------------------------------------------------------
 # Модели Silero TTS
@@ -125,6 +131,20 @@ TTS_CACHE_MAX_SECONDS = 180.0
 OCR_ENGINES = ("easyocr", "tesseract")
 DEFAULT_OCR_ENGINE = "easyocr"
 OCR_LANGUAGES = ["ru", "en"]
+
+# Отсечение имени говорящего в начале реплики («Хозия: Несите его сюда!» ->
+# «Несите его сюда!») — см. text_filter.strip_speaker_name.
+#   "off"  — выключено, текст озвучивается как распознан (по умолчанию: без
+#            явного решения пользователя менять распознанный текст не нужно).
+#   "auto" — по шаблону: 1-2 слова с заглавной буквы перед «:» или «—» в
+#            начале строки считаются именем всегда. Удобно, но может иногда
+#            по ошибке отрезать обычное вводное слово фразы («Запомни:» —
+#            формально неотличимо от имени по одной грамматике).
+#   "list" — только слова из пользовательского списка (SPEAKER_NAMES_FILE)
+#            считаются именем. Надёжнее (не срезает случайно), но персонажей
+#            нужно вписать в список самому.
+SPEAKER_NAME_MODES = ("off", "auto", "list")
+DEFAULT_SPEAKER_NAME_MODE = "off"
 
 # Порог похожести (в процентах) для отсеивания повторов.
 SIMILARITY_THRESHOLD = 85
@@ -220,6 +240,7 @@ class Settings:
     # 1.0 — полностью непрозрачная. Значение по умолчанию совпадает с
     # overlay.IDLE_ALPHA, которая была до появления этой настройки.
     overlay_alpha: float = DEFAULT_OVERLAY_ALPHA
+    speaker_name_mode: str = DEFAULT_SPEAKER_NAME_MODE
 
     # -- сохранение / загрузка -------------------------------------------------
 
@@ -279,6 +300,8 @@ class Settings:
 
     def _validate(self) -> None:
         """Приводит значения к допустимым диапазонам."""
+        if self.speaker_name_mode not in SPEAKER_NAME_MODES:
+            self.speaker_name_mode = DEFAULT_SPEAKER_NAME_MODE
         if self.ocr_engine not in OCR_ENGINES:
             self.ocr_engine = DEFAULT_OCR_ENGINE
         if self.tts_model not in SILERO_MODELS:

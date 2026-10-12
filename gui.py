@@ -19,7 +19,7 @@ import customtkinter as ctk
 
 import config
 from overlay import SelectionOverlay
-from pronunciation import StressDictionary
+from pronunciation import SpeakerNameList, StressDictionary
 from workers import EventBus, NeuroVoxEngine, OverlayCaptureGate, SharedSettings
 
 logger = logging.getLogger("neurovox.gui")
@@ -42,6 +42,11 @@ OCR_LABELS = {
 MODEL_LABELS = {
     "v5_5_ru": "Silero v5.5 (точные ударения)",
     "v4_ru": "Silero v4 (старая, запасная)",
+}
+SPEAKER_NAME_MODE_LABELS = {
+    "off": "Выключено",
+    "auto": "Автоматически",
+    "list": "По списку",
 }
 
 # Цвета статуса.
@@ -106,11 +111,15 @@ class MainWindow(ctk.CTk):
         self.overlays: List[SelectionOverlay] = []   # по одной рамке на область; создаются после интерфейса
         self._area_widgets: List[ctk.CTkBaseClass] = []
         self._stress_dictionary = StressDictionary()
+        self._speaker_names = SpeakerNameList()
         self._gate_poll_job: Optional[str] = None
 
         self._voice_by_label: Dict[str, str] = {label: key for key, label in config.SILERO_SPEAKERS.items()}
         self._engine_by_label: Dict[str, str] = {label: key for key, label in OCR_LABELS.items()}
         self._model_by_label: Dict[str, str] = {label: key for key, label in MODEL_LABELS.items()}
+        self._speaker_name_mode_by_label: Dict[str, str] = {
+            label: key for key, label in SPEAKER_NAME_MODE_LABELS.items()
+        }
         self._starting = False
         self._startup_failed = False
 
@@ -298,7 +307,24 @@ class MainWindow(ctk.CTk):
         ctk.CTkButton(
             options, text="Открыть словарь ударений", command=self._open_stress_dictionary,
             fg_color="#3a4358", hover_color="#2d3547",
-        ).grid(row=8, column=1, padx=(0, 16), pady=(8, 12), sticky="ew")
+        ).grid(row=8, column=1, padx=(0, 16), pady=8, sticky="ew")
+
+        add_row(9, "Имя говорящего")
+        self.speaker_name_menu = ctk.CTkOptionMenu(
+            options, values=list(self._speaker_name_mode_by_label), command=self._on_speaker_name_mode_change,
+        )
+        self.speaker_name_menu.set(
+            SPEAKER_NAME_MODE_LABELS.get(
+                self.settings.speaker_name_mode, SPEAKER_NAME_MODE_LABELS[config.DEFAULT_SPEAKER_NAME_MODE]
+            )
+        )
+        self.speaker_name_menu.grid(row=9, column=1, padx=(0, 16), pady=8, sticky="ew")
+
+        add_row(10, "")
+        ctk.CTkButton(
+            options, text="Открыть список имён", command=self._open_speaker_names,
+            fg_color="#3a4358", hover_color="#2d3547",
+        ).grid(row=10, column=1, padx=(0, 16), pady=(0, 12), sticky="ew")
 
         # -- журнал ---------------------------------------------------------
         log_frame = ctk.CTkFrame(self, corner_radius=12)
@@ -549,6 +575,27 @@ class MainWindow(ctk.CTk):
             )
         except Exception as exc:  # noqa: BLE001
             self._log(f"⚠ Не удалось открыть словарь ударений: {exc}")
+
+    def _on_speaker_name_mode_change(self, label: str) -> None:
+        mode = self._speaker_name_mode_by_label.get(label, config.DEFAULT_SPEAKER_NAME_MODE)
+        self.shared.update(speaker_name_mode=mode)
+        self.settings.speaker_name_mode = mode
+
+    def _open_speaker_names(self) -> None:
+        """Открывает список имён говорящих в «Блокноте» (файл создаётся с инструкцией при первом открытии)."""
+        try:
+            path = self._speaker_names.ensure_file()
+            if sys.platform == "win32":
+                os.startfile(str(path))  # noqa: S606 — открываем свой файл
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+            self._log(
+                "Список имён говорящих открыт. Впишите имена персонажей игры, по одному на строку, "
+                "сохраните файл — программа подхватит изменения сама. Список используется, только "
+                "если для «Имя говорящего» выбрано «По списку»."
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"⚠ Не удалось открыть список имён говорящих: {exc}")
 
     def _on_voice_change(self, label: str) -> None:
         speaker = self._voice_by_label.get(label, config.DEFAULT_SPEAKER)

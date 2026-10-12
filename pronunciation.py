@@ -146,6 +146,99 @@ def _match_case(source: str, replacement: str) -> str:
     return replacement
 
 
+SPEAKER_NAMES_TEMPLATE = """# Список имён говорящих NeuroVox
+#
+# Сюда можно вписать имена персонажей игры, чтобы программа узнавала их в
+# начале реплики («Хозия: Несите его сюда!») и озвучивала только саму
+# реплику («Несите его сюда!»), без имени.
+#
+# Как пользоваться:
+#   1. Впишите имя (или имя и фамилию, если в игре пишут полностью), по
+#      одному на строку. Регистр букв значения не имеет.
+#   2. Сохраните файл (Ctrl+S). Перезапускать программу не нужно: список
+#      применяется сам при следующей распознанной фразе.
+#   3. Этот список используется, только если в настройках программы выбран
+#      режим «По списку» для отсечения имени говорящего — в режиме «Автоматически»
+#      он не нужен, а в режиме «Выключено» не используется вовсе.
+#
+# Строки, которые начинаются с «#», — комментарии, программа их пропускает.
+#
+# Примеры (чтобы включить, уберите «#» в начале строки):
+# Хозия
+# Сьюзан
+# Датч
+
+"""
+
+
+class SpeakerNameList:
+    """
+    Пользовательский список имён говорящих, с автоматической перезагрузкой
+    файла — устроен так же, как StressDictionary ниже (тот же приём: имя
+    файла хранится в config, при каждом обращении проверяется, не изменился
+    ли файл на диске, и если да — перечитывается).
+    """
+
+    def __init__(self, path: Optional[Path] = None) -> None:
+        self._explicit_path = path
+        self._lock = threading.Lock()
+        self._signature: Optional[Tuple[int, int]] = None
+        self._names: "set[str]" = set()
+
+    @property
+    def path(self) -> Path:
+        return self._explicit_path or config.SPEAKER_NAMES_FILE
+
+    def ensure_file(self) -> Path:
+        """Создаёт файл списка с инструкцией, если его ещё нет. Возвращает путь к файлу."""
+        path = self.path
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(SPEAKER_NAMES_TEMPLATE, encoding="utf-8-sig")
+        return path
+
+    def __len__(self) -> int:
+        self._reload_if_changed()
+        return len(self._names)
+
+    def contains(self, name: str) -> bool:
+        """Проверяет, есть ли ``name`` в списке (без учёта регистра)."""
+        self._reload_if_changed()
+        return name.strip().lower() in self._names
+
+    # -- внутреннее ---------------------------------------------------------
+
+    def _reload_if_changed(self) -> None:
+        try:
+            info = os.stat(self.path)
+            signature: Optional[Tuple[int, int]] = (info.st_mtime_ns, info.st_size)
+        except OSError:
+            signature = None
+
+        with self._lock:
+            if signature == self._signature:
+                return
+            self._signature = signature
+            if signature is None:
+                self._names = set()
+                return
+            try:
+                text = self.path.read_text(encoding="utf-8-sig")
+            except (OSError, UnicodeDecodeError) as exc:
+                logger.warning("Не удалось прочитать список имён говорящих (%s): %s", self.path, exc)
+                self._names = set()
+                return
+
+            names = set()
+            for raw_line in text.splitlines():
+                line = raw_line.strip().lstrip("\ufeff")
+                if not line or line.startswith("#"):
+                    continue
+                names.add(line.lower())
+            self._names = names
+            logger.info("Список имён говорящих загружен: %d имён.", len(names))
+
+
 class StressDictionary:
     """Пользовательский словарь ударений с автоматической перезагрузкой файла."""
 

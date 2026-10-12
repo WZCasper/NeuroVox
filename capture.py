@@ -119,6 +119,79 @@ class ScreenCapture:
             pass
 
 
+def _otsu_separation(gray: np.ndarray) -> float:
+    """
+    Насколько чётко канал ``gray`` делится на два кластера (текст/фон) —
+    межклассовая дисперсия метода Оцу при его оптимальном пороге, нормированная
+    на дисперсию всего канала (0 — разделения нет вообще, 1 — идеальные два
+    пика). Используется только для СРАВНЕНИЯ нескольких каналов между собой
+    (см. _best_grayscale_channel), а не для самой бинаризации — порог,
+    который реально применяется к пикселям, по-прежнему считает cv2.threshold
+    с флагом THRESH_OTSU в _binarize_otsu.
+    """
+    histogram = cv2.calcHist([gray], [0], None, [256], [0, 256]).flatten()
+    total = float(gray.size)
+    if total == 0:
+        return 0.0
+    overall_mean = float(np.dot(histogram, np.arange(256))) / total
+    overall_variance = float(np.dot(histogram, (np.arange(256) - overall_mean) ** 2)) / total
+    if overall_variance <= 1e-6:
+        return 0.0   # канал полностью однороден — делить нечего
+
+    best_between_class_variance = 0.0
+    weight_background = 0.0
+    sum_background = 0.0
+    overall_sum = overall_mean * total
+    for level in range(256):
+        weight_background += histogram[level]
+        if weight_background == 0:
+            continue
+        weight_foreground = total - weight_background
+        if weight_foreground == 0:
+            break
+        sum_background += level * histogram[level]
+        mean_background = sum_background / weight_background
+        mean_foreground = (overall_sum - sum_background) / weight_foreground
+        between_class_variance = (
+            weight_background * weight_foreground * (mean_background - mean_foreground) ** 2
+        ) / (total * total)
+        if between_class_variance > best_between_class_variance:
+            best_between_class_variance = between_class_variance
+
+    return best_between_class_variance / overall_variance
+
+
+def _best_grayscale_channel(frame: np.ndarray) -> np.ndarray:
+    """
+    Выбирает, по какому одноканальному изображению бинаризовать кадр.
+
+    Обычная яркость (luma, как при простом переводе в оттенки серого) верно
+    разделяет текст и фон в подавляющем большинстве игр: светлый текст на
+    тёмной сцене или тёмный на светлой — в обоих случаях у текста и фона
+    разная яркость, и этого достаточно. Но у ЦВЕТНОГО текста БЕЗ ТЁМНОЙ
+    ОБВОДКИ на светлом фоне (например, малиновые/розовые субтитры на ярком
+    голубовато-белом фоне сцены) яркость текста и фона может быть почти
+    одинаковой, хотя цвет — явно разным; luma в этом случае «не видит» текст
+    почти совсем, и OCR на выходе читает случайные контуры фона вместо
+    субтитра. Канал НАСЫЩЕННОСТИ (S из HSV) устроен иначе: у яркого цветного
+    текста насыщенность высокая, у белого/светло-серого фона — низкая
+    (почти обесцвечен), так что именно по насыщенности такой текст отделяется
+    от фона чётко, даже когда по яркости они неразличимы.
+
+    Чтобы не ухудшить все остальные, уже хорошо работающие случаи (обычный
+    текст с обводкой, где у luma разделение и так отличное), оба канала
+    СРАВНИВАЮТСЯ между собой по _otsu_separation, и используется тот, где
+    разделение на два кластера чётче — для подавляющего большинства кадров
+    это по-прежнему окажется luma.
+    """
+    luma = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    saturation = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[:, :, 1]
+
+    if _otsu_separation(saturation) > _otsu_separation(luma):
+        return saturation
+    return luma
+
+
 def _binarize_otsu(gray: np.ndarray) -> np.ndarray:
     """
     Бинаризация методом Оцу: один порог яркости на весь кадр.
@@ -188,9 +261,12 @@ def _remove_small_components(binary: np.ndarray, min_area: float) -> np.ndarray:
 
 def preprocess_for_ocr(frame: np.ndarray) -> Optional[np.ndarray]:
     """
-    Готовит кадр к распознаванию: увеличение, серый цвет, бинаризация.
+    Готовит кадр к распознаванию: выбор канала, увеличение, бинаризация.
 
-    Способ бинаризации выбирается по фону кадра: для однородного фона
+    Канал, на основе которого ищется текст, выбирается между обычной
+    яркостью и насыщенностью цвета — см. _best_grayscale_channel. Это
+    отдельный выбор от способа бинаризации ниже: способ бинаризации
+    выбирается по фону кадра: для однородного фона
     (например, ровная плашка под субтитрами) используется метод Оцу — он
     даёт наиболее чистый контур буквы именно в этом случае. Если же в кадре
     заметен перепад яркости (субтитр наложен прямо на сцену, где одна часть
@@ -204,7 +280,7 @@ def preprocess_for_ocr(frame: np.ndarray) -> Optional[np.ndarray]:
     if frame is None or frame.size == 0:
         return None
 
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = _best_grayscale_channel(frame)
     gray = cv2.resize(
         gray, None, fx=UPSCALE_FACTOR, fy=UPSCALE_FACTOR, interpolation=cv2.INTER_CUBIC
     )

@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pronunciation import (  # noqa: E402
+    SpeakerNameList,
     StressDictionary,
     normalize_caps,
     parse_dictionary,
@@ -191,6 +192,92 @@ class StressDictionaryTests(unittest.TestCase):
     def test_empty_text_input(self):
         sd = StressDictionary(self.path)
         self.assertEqual(sd.apply(""), "")
+
+
+class SpeakerNameListTests(unittest.TestCase):
+    """
+    Список имён говорящих (режим "list" отсечения имени — см. text_filter.
+    strip_speaker_name) — устроен так же, как StressDictionary выше, и тесты
+    проверяют его по тому же образцу: создание файла-шаблона, чтение,
+    автоматическую перезагрузку при изменении на диске.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmp.name) / "speaker_names.txt"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_contains_with_no_file_is_always_false(self):
+        names = SpeakerNameList(self.path)
+        self.assertFalse(names.contains("Хозия"))
+        self.assertEqual(len(names), 0)
+
+    def test_ensure_file_creates_template_with_instructions(self):
+        names = SpeakerNameList(self.path)
+        created = names.ensure_file()
+        self.assertEqual(created, self.path)
+        self.assertTrue(self.path.exists())
+        content = self.path.read_text(encoding="utf-8-sig")
+        self.assertIn("имён говорящих", content)
+
+    def test_ensure_file_does_not_overwrite_existing_content(self):
+        self.path.write_text("Хозия\n", encoding="utf-8")
+        names = SpeakerNameList(self.path)
+        names.ensure_file()
+        self.assertEqual(self.path.read_text(encoding="utf-8"), "Хозия\n")
+
+    def test_simple_name_is_found(self):
+        self.path.write_text("Хозия\nДатч\n", encoding="utf-8")
+        names = SpeakerNameList(self.path)
+        self.assertTrue(names.contains("Хозия"))
+        self.assertTrue(names.contains("Датч"))
+        self.assertEqual(len(names), 2)
+
+    def test_lookup_is_case_insensitive(self):
+        self.path.write_text("Хозия\n", encoding="utf-8")
+        names = SpeakerNameList(self.path)
+        self.assertTrue(names.contains("хозия"))
+        self.assertTrue(names.contains("ХОЗИЯ"))
+
+    def test_name_not_in_the_list_is_not_found(self):
+        self.path.write_text("Датч\n", encoding="utf-8")
+        names = SpeakerNameList(self.path)
+        self.assertFalse(names.contains("Хозия"))
+
+    def test_comment_lines_are_skipped(self):
+        self.path.write_text("# это комментарий\nХозия\n", encoding="utf-8")
+        names = SpeakerNameList(self.path)
+        self.assertEqual(len(names), 1)
+        self.assertTrue(names.contains("Хозия"))
+
+    def test_blank_lines_are_skipped(self):
+        self.path.write_text("Хозия\n\n\nДатч\n", encoding="utf-8")
+        names = SpeakerNameList(self.path)
+        self.assertEqual(len(names), 2)
+
+    def test_reload_picks_up_changes_after_modification(self):
+        self.path.write_text("Хозия\n", encoding="utf-8")
+        names = SpeakerNameList(self.path)
+        self.assertTrue(names.contains("Хозия"))
+        self.assertFalse(names.contains("Датч"))
+        time.sleep(0.02)   # гарантируем, что mtime файла реально изменится
+        self.path.write_text("Датч\n", encoding="utf-8")
+        self.assertFalse(names.contains("Хозия"))
+        self.assertTrue(names.contains("Датч"))
+
+    def test_reload_handles_file_deletion(self):
+        self.path.write_text("Хозия\n", encoding="utf-8")
+        names = SpeakerNameList(self.path)
+        self.assertEqual(len(names), 1)
+        self.path.unlink()
+        self.assertFalse(names.contains("Хозия"))
+        self.assertEqual(len(names), 0)
+
+    def test_empty_name_lookup(self):
+        names = SpeakerNameList(self.path)
+        self.assertFalse(names.contains(""))
 
 
 if __name__ == "__main__":

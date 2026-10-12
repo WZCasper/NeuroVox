@@ -48,6 +48,7 @@ import config
 from capture import AreaTracker, CaptureError, ScreenCapture, preprocess_for_ocr
 from frame_buffer import FrameBuffer
 from ocr_engine import BaseOcr, OcrError, create_with_fallback
+from pronunciation import SpeakerNameList
 from text_filter import SubtitleFilter, clean_text
 from tts_engine import SileroTts, TtsError
 
@@ -604,6 +605,7 @@ class OcrWorker(_LoopWorker):
         stop_event: threading.Event,
         ocr: BaseOcr,
         no_speech_warning_seconds: float = config.NO_SPEECH_WARNING_SECONDS,
+        speaker_names: Optional[SpeakerNameList] = None,
     ) -> None:
         super().__init__("OcrWorker", bus, stop_event)
         self._shared = shared
@@ -614,6 +616,10 @@ class OcrWorker(_LoopWorker):
         self._no_speech_warning_seconds = no_speech_warning_seconds
         self._speech_queue = speech_queue
         self._ocr = ocr
+        # Список имён для режима "list" отсечения имени говорящего (см.
+        # SubtitleFilter.speaker_name_mode ниже) — None, если вызывающий код
+        # его не передал (тесты, которые не используют эту настройку вовсе).
+        self._speaker_names = speaker_names
 
     def run(self) -> None:
         filters: Dict[int, SubtitleFilter] = {}
@@ -658,9 +664,12 @@ class OcrWorker(_LoopWorker):
                 subtitle_filter = filters.get(frame.area)
                 if subtitle_filter is None:
                     subtitle_filter = filters[frame.area] = SubtitleFilter(
-                        threshold=settings.similarity_threshold
+                        threshold=settings.similarity_threshold,
+                        speaker_name_mode=settings.speaker_name_mode,
+                        speaker_names=self._speaker_names,
                     )
                 subtitle_filter.threshold = settings.similarity_threshold
+                subtitle_filter.speaker_name_mode = settings.speaker_name_mode
 
                 if frame.is_marker:
                     # Область опустела: реплика закончилась, такая же фраза позже — уже новая.
@@ -963,6 +972,12 @@ class NeuroVoxEngine:
         # не трогая их окна напрямую из чужого потока. Без окна (тесты,
         # preview_recognition) остаётся None — снимки делаются как раньше.
         self._overlay_gate = overlay_gate
+        # Список имён говорящих для режима "list" отсечения имени (см.
+        # text_filter.strip_speaker_name и config.speaker_name_mode) — живёт
+        # здесь по тому же принципу, что StressDictionary внутри SileroTts:
+        # один экземпляр на весь запуск программы, файл на диске перечитывается
+        # сам при изменении (см. pronunciation.SpeakerNameList).
+        self._speaker_names = SpeakerNameList()
 
     @property
     def is_running(self) -> bool:
@@ -1026,7 +1041,8 @@ class NeuroVoxEngine:
             overlay_gate=self._overlay_gate,
         )
         ocr_thread = OcrWorker(
-            self._shared, self._bus, self._buffer, self._speech_queue, self._stop_event, self._ocr
+            self._shared, self._bus, self._buffer, self._speech_queue, self._stop_event, self._ocr,
+            speaker_names=self._speaker_names,
         )
         tts_thread = TtsPlaybackWorker(
             self._shared, self._bus, self._speech_queue, self._stop_event, self._tts, self._player
@@ -1154,7 +1170,7 @@ class NeuroVoxEngine:
                         self._bus.emit("error", f"{label}ошибка распознавания: {exc}")
                         continue
 
-                    cleaned = clean_text(raw_text)
+                    cleaned = clean_text(raw_text, settings.speaker_name_mode, self._speaker_names)
                     if not cleaned:
                         self._bus.emit(
                             "status",

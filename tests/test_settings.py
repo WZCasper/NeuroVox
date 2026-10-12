@@ -38,7 +38,8 @@ class SettingsTests(unittest.TestCase):
             path = Path(folder) / "settings.json"
             path.write_text(
                 '{"settings_version": 2, "speed": 99, "volume": -5, "capture_fps": 100, '
-                '"speaker": "нет_такого", "rois": [[1, 2]], "area_pause": 99, "overlay_alpha": 5}',
+                '"speaker": "нет_такого", "rois": [[1, 2]], "area_pause": 99, "overlay_alpha": 5, '
+                '"speaker_name_mode": "нет_такого_режима"}',
                 encoding="utf-8",
             )
             loaded = config.Settings.load(path)
@@ -48,8 +49,24 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(loaded.area_pause, config.MAX_AREA_PAUSE)
             self.assertEqual(loaded.overlay_alpha, 1.0)
             self.assertEqual(loaded.speaker, config.DEFAULT_SPEAKER)
+            self.assertEqual(loaded.speaker_name_mode, config.DEFAULT_SPEAKER_NAME_MODE)
             self.assertEqual(len(loaded.rois), 1)          # неверная область заменена областью по умолчанию
             self.assertEqual(len(loaded.rois[0]), 4)
+
+    def test_speaker_name_mode_accepts_each_valid_value(self):
+        for mode in config.SPEAKER_NAME_MODES:
+            with tempfile.TemporaryDirectory() as folder:
+                path = Path(folder) / "settings.json"
+                path.write_text(f'{{"speaker_name_mode": "{mode}"}}', encoding="utf-8")
+                self.assertEqual(config.Settings.load(path).speaker_name_mode, mode)
+
+    def test_speaker_name_mode_missing_from_an_older_settings_file_gets_the_default(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "settings.json"
+            path.write_text('{"settings_version": 2, "speed": 1.2}', encoding="utf-8")
+            loaded = config.Settings.load(path)
+            self.assertEqual(loaded.speaker_name_mode, config.DEFAULT_SPEAKER_NAME_MODE)
+            self.assertEqual(config.DEFAULT_SPEAKER_NAME_MODE, "off")
 
     def test_overlay_alpha_negative_is_clamped_to_zero(self):
         # Отдельно от общего теста выше: 0.0 — это ЗНАЧИМОЕ, а не дефолтное
