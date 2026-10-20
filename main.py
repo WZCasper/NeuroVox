@@ -116,8 +116,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     log = logging.getLogger("neurovox.main")
     log.info("Запуск %s версии %s", config.APP_NAME, config.APP_VERSION)
 
-    if sys.version_info < (3, 9):
-        message = "Требуется Python версии 3.9 или новее."
+    if sys.version_info < (3, 10):
+        # 3.10, а не 3.9: это нижняя граница, которую реально поддерживает
+        # остальной проект — README.md и requirements.txt уже заявляют
+        # «3.10 – 3.12», а NeuroVox.spec использует sys.stdlib_module_names,
+        # появившийся только в Python 3.10 (см. комментарий там же), так что
+        # сборка .exe на 3.9 физически невозможна. Эта проверка должна
+        # отражать тот же минимум, а не вводить пользователя в заблуждение.
+        message = "Требуется Python версии 3.10 или новее."
         log.error(message)
         _show_fatal_error(message)
         return 1

@@ -104,9 +104,11 @@ NeuroVox.exe --selftest --strict --models --out otchet.txt
 | `gui.py` | Главное окно (CustomTkinter) |
 | `overlay.py` | Прозрачная рамка выбора области |
 | `capture.py` | Захват экрана и бинаризация |
+| `frame_buffer.py` | Буфер снимков между потоком захвата и потоком распознавания |
 | `ocr_engine.py` | EasyOCR и Tesseract с автопереключением |
 | `text_filter.py` | Очистка текста и фильтр повторов |
 | `tts_engine.py` | Загрузка модели Silero и синтез речи |
+| `pronunciation.py` | Словарь ударений и список имён говорящих |
 | `workers.py` | Потоки, очереди, воспроизведение звука |
 | `selftest.py` | Самопроверка собранной программы |
 | `config.py` | Настройки, константы, папки данных |

@@ -209,13 +209,22 @@ class SpeakerNameList:
     # -- внутреннее ---------------------------------------------------------
 
     def _reload_if_changed(self) -> None:
-        try:
-            info = os.stat(self.path)
-            signature: Optional[Tuple[int, int]] = (info.st_mtime_ns, info.st_size)
-        except OSError:
-            signature = None
-
+        # os.stat() — внутри блокировки, а не до неё: иначе между чужим
+        # os.stat() и входом в with self._lock другой поток мог успеть сам
+        # перечитать файл и обновить self._signature, и тогда первый поток,
+        # уже держа устаревшую сигнатуру, тоже перечитывал бы тот же файл
+        # ещё раз подряд — не повреждение данных (read_text атомарен), но
+        # лишняя, задвоенная работа на двух потоках там, где должен
+        # справиться один. stat() — быстрый системный вызов (только
+        # метаданные, не содержимое файла), так что удержание блокировки на
+        # его время не создаёт заметной задержки.
         with self._lock:
+            try:
+                info = os.stat(self.path)
+                signature: Optional[Tuple[int, int]] = (info.st_mtime_ns, info.st_size)
+            except OSError:
+                signature = None
+
             if signature == self._signature:
                 return
             self._signature = signature
@@ -286,13 +295,16 @@ class StressDictionary:
     # -- внутреннее ---------------------------------------------------------
 
     def _reload_if_changed(self) -> None:
-        try:
-            info = os.stat(self.path)
-            signature: Optional[Tuple[int, int]] = (info.st_mtime_ns, info.st_size)
-        except OSError:
-            signature = None          # файла нет — словарь пуст
-
+        # os.stat() — внутри блокировки, та же причина и то же решение, что
+        # и в SpeakerNameList._reload_if_changed выше: без этого два потока
+        # могли подряд перечитать и заново разобрать один и тот же словарь.
         with self._lock:
+            try:
+                info = os.stat(self.path)
+                signature: Optional[Tuple[int, int]] = (info.st_mtime_ns, info.st_size)
+            except OSError:
+                signature = None          # файла нет — словарь пуст
+
             if signature == self._signature:
                 return
             self._signature = signature

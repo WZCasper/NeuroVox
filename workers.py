@@ -445,21 +445,10 @@ class CaptureWorker(_LoopWorker):
         self._overlay_gate = overlay_gate
 
     def _grab_area(self, capture: ScreenCapture, roi) -> np.ndarray:
-        """
-        Снимает одну область, на время самого снимка пряча рамки через
-        overlay_gate (если он установлен и GUI сейчас его обслуживает) — см.
-        OverlayCaptureGate выше. Рамка возвращается на экран сразу после
-        снимка, независимо от того, успешен он был или бросил исключение.
-        """
-        gate = self._overlay_gate
-        if gate is None:
-            return capture.grab(roi)
-        hidden = gate.request_hide()
-        try:
-            return capture.grab(roi)
-        finally:
-            if hidden:
-                gate.request_show()
+        """Снимает одну область. Рамки прячет/показывает вызывающий код
+        (run()) один раз на весь проход по всем областям — см. комментарий
+        там же про то, почему это не делается здесь на каждую область."""
+        return capture.grab(roi)
 
     def run(self) -> None:
         # mss нужно создавать именно в том потоке, где он используется.
@@ -487,20 +476,38 @@ class CaptureWorker(_LoopWorker):
 
                 failure: Optional[str] = None
                 now = time.monotonic()
-                for index, roi in enumerate(rois):
-                    try:
-                        image = preprocess_for_ocr(self._grab_area(capture, tuple(roi)))
-                    except CaptureError as exc:
-                        failure = str(exc)
-                        continue
-                    except Exception as exc:  # noqa: BLE001 — поток не должен падать из-за одного кадра
-                        logger.exception("Непредвиденная ошибка в цикле снимков")
-                        failure = f"Непредвиденная ошибка: {exc}"
-                        continue
+                # Рамки прячутся один раз на весь проход по rois, а не на
+                # каждую область отдельно: при нескольких настроенных
+                # областях (MAX_AREAS = 6) попарная схема «спрячь все рамки
+                # на экране → сними одну область → покажи все рамки, и так
+                # на каждую» давала заметное мерцание рамок на частоте
+                # capture_fps (до 30 раз в секунду) и лишние обращения к
+                # главному потоку GUI через OverlayCaptureGate. Здесь рамки
+                # прячутся один раз перед первым снимком цикла и
+                # показываются один раз после последнего — gate.request_hide
+                # уже рассчитан именно на такое использование: см. пример в
+                # его докстринге, где capture.grab вызывается один раз между
+                # hide и show, а не внутри них для каждого кадра отдельно.
+                gate = self._overlay_gate
+                hidden = gate.request_hide() if (gate is not None and rois) else False
+                try:
+                    for index, roi in enumerate(rois):
+                        try:
+                            image = preprocess_for_ocr(self._grab_area(capture, tuple(roi)))
+                        except CaptureError as exc:
+                            failure = str(exc)
+                            continue
+                        except Exception as exc:  # noqa: BLE001 — поток не должен падать из-за одного кадра
+                            logger.exception("Непредвиденная ошибка в цикле снимков")
+                            failure = f"Непредвиденная ошибка: {exc}"
+                            continue
 
-                    commit = trackers[index].update(image, now)
-                    if commit is not None:
-                        self._buffer.put(index, commit.image, settled=commit.settled, captured_at=now)
+                        commit = trackers[index].update(image, now)
+                        if commit is not None:
+                            self._buffer.put(index, commit.image, settled=commit.settled, captured_at=now)
+                finally:
+                    if hidden:
+                        gate.request_show()
 
                 if failure is not None:
                     consecutive_errors += 1
