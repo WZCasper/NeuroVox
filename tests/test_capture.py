@@ -88,6 +88,26 @@ class AdaptiveBinarizationTests(unittest.TestCase):
         background_only = np.full((100, 600), 30, dtype=np.uint8)
         self.assertLess(float(np.std(background_only)), capture.BACKGROUND_UNIFORMITY_STD_THRESHOLD)
 
+    def test_uniform_background_with_real_text_goes_above_threshold(self):
+        # Дополняет тест выше: тот же однородный фон (30, 34, 50), что и у
+        # _frame_with_text, но теперь С контрастным текстом, через тот же
+        # путь обработки, что и preprocess_for_ocr (_best_grayscale_channel +
+        # апскейл + блюр), а не через голый np.std на сырых пикселях. На
+        # практике это означает, что подавляющее большинство реальных,
+        # читаемых субтитров — даже на полностью однородной плашке — уходит
+        # на адаптивный путь бинаризации, а не на Оцу: см. комментарий над
+        # BACKGROUND_UNIFORMITY_STD_THRESHOLD в capture.py для разбора, почему
+        # так и остаётся ожидаемым, а не ошибочным поведением критерия.
+        frame = _frame_with_text()
+        gray = capture._best_grayscale_channel(frame)
+        gray = cv2.resize(
+            gray, None, fx=capture.UPSCALE_FACTOR, fy=capture.UPSCALE_FACTOR,
+            interpolation=cv2.INTER_CUBIC,
+        )
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        std_with_text = float(np.std(gray))
+        self.assertGreaterEqual(std_with_text, capture.BACKGROUND_UNIFORMITY_STD_THRESHOLD, std_with_text)
+
     def test_gradient_background_alone_is_above_threshold(self):
         height, width = 150, 900
         gray = np.zeros((height, width), dtype=np.uint8)

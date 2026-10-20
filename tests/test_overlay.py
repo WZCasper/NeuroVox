@@ -24,11 +24,21 @@ try:
 except Exception:  # noqa: BLE001 — любая причина недоступности дисплея
     _DISPLAY_AVAILABLE = False
 
+# overlay.py сам по себе не требует дисплея для импорта — он импортирует
+# tkinter на верхнем уровне (чтобы дать типы вроде tkinter.Toplevel), но не
+# создаёт окно при импорте модуля. Clamp01Tests ниже тестирует _clamp01() —
+# чистую функцию без побочных эффектов — и по докстрингу класса намеренно
+# не требует дисплея, в отличие от остальных тестов файла. Поэтому сам
+# import overlay (и то, что из него берётся для Clamp01Tests) не прячем за
+# _DISPLAY_AVAILABLE — иначе Clamp01Tests ломается именно там, где
+# задумывался как самый нетребовательный тест в файле.
+import overlay as overlay_module
+from overlay import IDLE_ALPHA, _clamp01
+
 if _DISPLAY_AVAILABLE:
     import customtkinter as ctk
 
-    import overlay as overlay_module
-    from overlay import ACTIVE_ALPHA, IDLE_ALPHA, READING_ALPHA, SelectionOverlay, _clamp01
+    from overlay import ACTIVE_ALPHA, READING_ALPHA, SelectionOverlay
 
 
 class _FakeUser32:
@@ -217,7 +227,18 @@ class OverlayAlphaSettingTests(unittest.TestCase):
         except (tkinter.TclError, AttributeError):
             pass
 
-    def _make_overlay(self, idle_alpha=IDLE_ALPHA):
+    def _make_overlay(self, idle_alpha=None):
+        # idle_alpha=None, а не =IDLE_ALPHA: значения по умолчанию аргументов
+        # вычисляются в момент определения функции, то есть при самом импорте
+        # модуля — раньше, чем успевает сработать @unittest.skipUnless на
+        # строке 199. В headless-окружении IDLE_ALPHA никогда не импортирован
+        # (см. блок if _DISPLAY_AVAILABLE выше), и такой default уронил бы
+        # весь модуль NameError'ом при импорте вместо того, чтобы тесты этого
+        # класса были просто пропущены. Резолвим реальное значение здесь,
+        # внутри тела метода, — сюда код попадает, только когда дисплей уже
+        # есть и IDLE_ALPHA гарантированно доступен.
+        if idle_alpha is None:
+            idle_alpha = IDLE_ALPHA
         self.root = ctk.CTk()
         self.root.withdraw()
         self.overlay = SelectionOverlay(self.root, (10, 10, 300, 100), index=0, idle_alpha=idle_alpha)

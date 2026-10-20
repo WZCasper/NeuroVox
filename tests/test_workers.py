@@ -535,83 +535,61 @@ class OverlayCaptureGateTests(unittest.TestCase):
 
 class CaptureWorkerOverlayGateIntegrationTests(unittest.TestCase):
     """
-    CaptureWorker._grab_area() — убеждаемся, что при установленном
-    overlay_gate каждый снимок области действительно обёрнут в
-    request_hide()/request_show(), а без gate (как раньше) ничего не
-    меняется в поведении снимка.
+    CaptureWorker.run() — убеждаемся, что при установленном overlay_gate
+    рамки прячутся и показываются РОВНО ОДИН РАЗ за весь проход по rois
+    в рамках одного цикла снимков, а не отдельно на каждую область.
+
+    До этого теста (и до соответствующего исправления в CaptureWorker)
+    hide()/show() вызывались внутри _grab_area() — то есть попарно вокруг
+    каждой области по отдельности. При нескольких настроенных областях
+    (MAX_AREAS = 6) это означало, что рамки на экране прячутся и
+    показываются N раз за один проход цикла снимков вместо одного — отсюда
+    заметное мерцание рамок на частоте capture_fps (до 30 раз в секунду)
+    и лишняя нагрузка на обмен с главным потоком GUI через
+    OverlayCaptureGate. Текущая реализация переносит hide()/show() на
+    уровень run(): одна пара запросов оборачивает весь проход по всем
+    настроенным областям за цикл — это то, что здесь и проверяется.
     """
 
-    def test_grab_area_calls_hide_then_show_around_the_snapshot(self):
+    @staticmethod
+    def _run_one_cycle(worker, stop_event, timeout=2.0):
+        """Пускает worker.run() в отдельном потоке и ждёт, пока он сам не
+        остановится (stop_event выставляется подложным grab — см. ниже,
+        после ровно одного прохода цикла while)."""
+        thread = threading.Thread(target=worker.run, name="CaptureWorkerTest")
+        thread.start()
+        thread.join(timeout=timeout)
+        assert not thread.is_alive(), "CaptureWorker.run() не остановился вовремя"
+
+    def test_hide_and_show_wrap_the_whole_cycle_once_for_multiple_areas(self):
+        """Доказательство исправления: 3 области, но только одна пара hide/show."""
         gate = OverlayCaptureGate()
         order = []
         gate.install(lambda: order.append("hide"), lambda: order.append("show"))
 
+        stop_event = threading.Event()
+        grabbed_rois = []
+
         class _Capture:
             def grab(self, roi):
-                order.append("grab")
-                return "image"
+                order.append(f"grab:{roi}")
+                grabbed_rois.append(roi)
+                if len(grabbed_rois) == 3:
+                    # Третий (последний для этого цикла) снимок — останавливаем
+                    # worker сразу после текущей итерации while, чтобы run()
+                    # вернулся, а не крутился бесконечно в тесте.
+                    stop_event.set()
+                return _frame_with_outlined_text()
 
-        shared = SharedSettings(config.Settings())
+            def close(self):
+                pass
+
+        settings = config.Settings()
+        settings.rois = [[0, 0, 400, 80], [0, 100, 400, 80], [0, 200, 400, 80]]
+        shared = SharedSettings(settings)
         worker = CaptureWorker(
-            shared, EventBus(), buffer=None, stop_event=threading.Event(),
-            overlay_gate=gate,
-        )
-
-        # poll() на отдельном потоке, пока идёт снимок — так же, как в
-        # реальной программе это делает gui._poll_gate на быстром таймере.
-        stop_polling = threading.Event()
-
-        def poller():
-            while not stop_polling.is_set():
-                gate.poll()
-                time.sleep(0.005)
-
-        poll_thread = threading.Thread(target=poller)
-        poll_thread.start()
-        try:
-            image = worker._grab_area(_Capture(), (0, 0, 10, 10))
-            # request_show() внутри _grab_area только ставит запрос в
-            # очередь и не ждёт его выполнения (см. docstring
-            # OverlayCaptureGate.request_show) — ждём здесь явно, в тесте,
-            # пока poller-поток его не обработает.
-            deadline = time.monotonic() + 2.0
-            while "show" not in order and time.monotonic() < deadline:
-                time.sleep(0.005)
-        finally:
-            stop_polling.set()
-            poll_thread.join(timeout=1.0)
-
-        self.assertEqual(image, "image")
-        self.assertEqual(order, ["hide", "grab", "show"])
-
-    def test_grab_area_without_gate_just_grabs(self):
-        class _Capture:
-            def grab(self, roi):
-                return "image"
-
-        shared = SharedSettings(config.Settings())
-        worker = CaptureWorker(
-            shared, EventBus(), buffer=None, stop_event=threading.Event(),
-            overlay_gate=None,
-        )
-        self.assertEqual(worker._grab_area(_Capture(), (0, 0, 10, 10)), "image")
-
-    def test_grab_area_shows_again_even_if_grab_raises(self):
-        # Рамка не должна остаться спрятанной насовсем, если сам снимок
-        # почему-то бросил исключение (например, CaptureError).
-        gate = OverlayCaptureGate()
-        order = []
-        gate.install(lambda: order.append("hide"), lambda: order.append("show"))
-
-        class _FailingCapture:
-            def grab(self, roi):
-                order.append("grab")
-                raise RuntimeError("симуляция сбоя снимка")
-
-        shared = SharedSettings(config.Settings())
-        worker = CaptureWorker(
-            shared, EventBus(), buffer=None, stop_event=threading.Event(),
-            overlay_gate=gate,
+            shared, EventBus(), buffer=_NullBuffer(), stop_event=stop_event,
+            capture_factory=_Capture, overlay_gate=gate,
         )
 
         stop_polling = threading.Event()
@@ -624,8 +602,91 @@ class CaptureWorkerOverlayGateIntegrationTests(unittest.TestCase):
         poll_thread = threading.Thread(target=poller)
         poll_thread.start()
         try:
-            with self.assertRaises(RuntimeError):
-                worker._grab_area(_FailingCapture(), (0, 0, 10, 10))
+            self._run_one_cycle(worker, stop_event)
+            deadline = time.monotonic() + 2.0
+            while order.count("show") < 1 and time.monotonic() < deadline:
+                time.sleep(0.005)
+        finally:
+            stop_polling.set()
+            poll_thread.join(timeout=1.0)
+
+        # Ровно один hide, три снимка между ним и show, ровно один show —
+        # не три пары hide/show, как было бы при попарной схеме на область.
+        self.assertEqual(order.count("hide"), 1, order)
+        self.assertEqual(order.count("show"), 1, order)
+        self.assertEqual(order.count("grab"), 0)  # сверяем точные grab:roi ниже
+        self.assertEqual(len([e for e in order if e.startswith("grab:")]), 3, order)
+        self.assertEqual(order[0], "hide", order)
+        self.assertEqual(order[-1], "show", order)
+
+    def test_without_gate_run_just_grabs_every_area(self):
+        """Без overlay_gate (как раньше — preview_recognition, тесты) поведение
+        снимков не меняется: ни одного обращения к несуществующему gate."""
+        stop_event = threading.Event()
+        grabbed = []
+
+        class _Capture:
+            def grab(self, roi):
+                grabbed.append(roi)
+                if len(grabbed) == 2:
+                    stop_event.set()
+                return _frame_with_outlined_text()
+
+            def close(self):
+                pass
+
+        settings = config.Settings()
+        settings.rois = [[0, 0, 400, 80], [0, 100, 400, 80]]
+        shared = SharedSettings(settings)
+        worker = CaptureWorker(
+            shared, EventBus(), buffer=_NullBuffer(), stop_event=stop_event,
+            capture_factory=_Capture, overlay_gate=None,
+        )
+        self._run_one_cycle(worker, stop_event)
+        self.assertEqual(len(grabbed), 2)
+
+    def test_show_is_still_called_even_if_one_area_raises(self):
+        """Рамка не должна остаться спрятанной насовсем, если снимок одной
+        из областей бросил исключение — ошибка в середине прохода не должна
+        пропустить request_show() в конце цикла."""
+        gate = OverlayCaptureGate()
+        order = []
+        gate.install(lambda: order.append("hide"), lambda: order.append("show"))
+
+        stop_event = threading.Event()
+        calls = []
+
+        class _Capture:
+            def grab(self, roi):
+                calls.append(roi)
+                if len(calls) == 1:
+                    raise RuntimeError("симуляция сбоя снимка одной области")
+                if len(calls) == 2:
+                    stop_event.set()
+                return _frame_with_outlined_text()
+
+            def close(self):
+                pass
+
+        settings = config.Settings()
+        settings.rois = [[0, 0, 400, 80], [0, 100, 400, 80]]
+        shared = SharedSettings(settings)
+        worker = CaptureWorker(
+            shared, EventBus(), buffer=_NullBuffer(), stop_event=stop_event,
+            capture_factory=_Capture, overlay_gate=gate,
+        )
+
+        stop_polling = threading.Event()
+
+        def poller():
+            while not stop_polling.is_set():
+                gate.poll()
+                time.sleep(0.005)
+
+        poll_thread = threading.Thread(target=poller)
+        poll_thread.start()
+        try:
+            self._run_one_cycle(worker, stop_event)
             deadline = time.monotonic() + 2.0
             while "show" not in order and time.monotonic() < deadline:
                 time.sleep(0.005)
@@ -633,7 +694,52 @@ class CaptureWorkerOverlayGateIntegrationTests(unittest.TestCase):
             stop_polling.set()
             poll_thread.join(timeout=1.0)
 
-        self.assertEqual(order, ["hide", "grab", "show"])
+        self.assertIn("show", order)
+        self.assertEqual(len(calls), 2)
+
+    def test_no_areas_configured_does_not_touch_the_gate(self):
+        """rois пуст (пользователь ещё ничего не настроил) — gate не должен
+        получать ни одного запроса, цикл просто ничего не снимает."""
+        gate = OverlayCaptureGate()
+        order = []
+        gate.install(lambda: order.append("hide"), lambda: order.append("show"))
+
+        stop_event = threading.Event()
+        cycles = {"count": 0}
+
+        class _Capture:
+            def grab(self, roi):  # pragma: no cover — не должен вызываться
+                raise AssertionError("grab не должен вызываться без областей")
+
+            def close(self):
+                pass
+
+        settings = config.Settings()
+        settings.rois = []
+        shared = SharedSettings(settings)
+        worker = CaptureWorker(
+            shared, EventBus(), buffer=_NullBuffer(), stop_event=stop_event,
+            capture_factory=_Capture, overlay_gate=gate,
+        )
+
+        # Без снимков нечему выставить stop_event изнутри цикла — останавливаем
+        # снаружи, дав ровно одной итерации while отработать.
+        def stopper():
+            time.sleep(0.2)
+            stop_event.set()
+
+        threading.Thread(target=stopper).start()
+        self._run_one_cycle(worker, stop_event, timeout=3.0)
+        self.assertEqual(order, [])
+
+
+class _NullBuffer:
+    """Подделка FrameBuffer для тестов CaptureWorker.run(), которым сам
+    буфер не важен — реальный FrameBuffer требует config для лимитов, а
+    здесь интересен только порядок вызовов gate и capture."""
+
+    def put(self, *args, **kwargs):
+        pass
 
 
 if __name__ == "__main__":
