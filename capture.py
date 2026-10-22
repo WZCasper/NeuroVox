@@ -197,13 +197,50 @@ def _best_grayscale_channel(frame: np.ndarray) -> np.ndarray:
     СРАВНИВАЮТСЯ между собой по _otsu_separation, и используется тот, где
     разделение на два кластера чётче — для подавляющего большинства кадров
     это по-прежнему окажется luma.
+
+    ОДНА СИТУАЦИЯ, где это сравнение само по себе обманывает: белый текст
+    с ЧЁРНОЙ обводкой — самый обычный, частый стиль игровых субтитров.
+    Белый (S≈0) и чёрный (S≈0) в HSV почти неотличимы по насыщенности,
+    хотя по яркости это два противоположных полюса (255 и 0). Из-за этого
+    канал saturation иногда даёт формально более чёткое (по _otsu_separation)
+    разделение «фон / текст-и-обводка-вместе», чем luma, — но после такого
+    разделения на бинарном изображении обводка и заливка буквы сливаются в
+    одно целое, а последующая adaptive-бинаризация (локальный порог) не
+    находит контраста ВНУТРИ буквы между её же заливкой и её же обводкой —
+    получается полый контур вместо сплошного силуэта, который OCR читает
+    плохо или не читает вовсе (так и было поймано: самопроверка на реальных
+    кадрах EasyOCR проваливала распознавание именно на таких кейсах).
+    Проверяем это напрямую — для каждого канала делаем его СОБСТВЕННЫЙ
+    Otsu-разрез на две группы и смотрим на разброс яркости (V из HSV)
+    внутри МЕНЬШЕЙ по площади группы (это обычно текст+обводка, а не фон,
+    тот же принцип «текст — меньшая площадь», что и в _binarize_otsu выше).
+    Большой разброс яркости внутри одной, по идее однородной по смыслу
+    группы — верный признак того, что в неё попали два разных элемента
+    (светлая буква и тёмная обводка), и канал для бинаризации ненадёжен.
     """
     luma = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    saturation = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[:, :, 1]
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    saturation = hsv[:, :, 1]
 
-    if _otsu_separation(saturation) > _otsu_separation(luma):
+    if _otsu_separation(saturation) > _otsu_separation(luma) and not _saturation_confounds_outline(hsv):
         return saturation
     return luma
+
+
+def _saturation_confounds_outline(hsv: np.ndarray) -> bool:
+    """True, если канал насыщенности неразличимо смешивает ахроматичный
+    (белый/серый/чёрный) текст с его же ахроматичной обводкой — см.
+    docstring _best_grayscale_channel выше для полного разбора причины."""
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    _, otsu_mask = cv2.threshold(saturation, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    group_a = value[otsu_mask > 0]
+    group_b = value[otsu_mask == 0]
+    smaller_group = group_a if group_a.size < group_b.size else group_b
+    if smaller_group.size < 10:
+        return False
+    spread = float(np.percentile(smaller_group, 90) - np.percentile(smaller_group, 10))
+    return spread > 100.0
 
 
 def _binarize_otsu(gray: np.ndarray) -> np.ndarray:
