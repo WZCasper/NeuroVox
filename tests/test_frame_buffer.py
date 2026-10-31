@@ -99,6 +99,100 @@ class PendingReplacementTests(unittest.TestCase):
         self.assertEqual(len(self.buffer), 2)   # у области 0 — замена, у области 1 — как было
 
 
+class SkipToLatestTests(unittest.TestCase):
+    """
+    skip_to_latest — явный запрос «догнать» более свежий снимок той же
+    области, если он успел накопиться, пока текущий ждал своей очереди.
+    В отличие от замены при put() (см. PendingReplacementTests выше), эта
+    замена не происходит сама по себе — её явно вызывает OcrWorker перед
+    распознаванием (см. workers.py), и только устоявшиеся снимки, которые
+    put() сознательно НЕ вытесняет друг другом, тоже могут быть пропущены
+    этим путём.
+    """
+
+    def setUp(self):
+        self.clock = _Clock()
+        self.buffer = FrameBuffer(max_frames=64, retention=5.0, max_unread_age=30.0, clock=self.clock)
+
+    def test_returns_none_when_no_newer_frame_of_same_area(self):
+        # after_seq и так единственный/самый свежий кандидат своей области —
+        # он будет распознан как обычно, ничего не пропущено.
+        first = self.buffer.put(area=0, image=_img(1), settled=True)
+        frame, skipped = self.buffer.skip_to_latest(area=0, after_seq=first.seq)
+        self.assertIsNone(frame)
+        self.assertEqual(skipped, 0)
+
+    def test_returns_latest_and_correct_skipped_count(self):
+        first = self.buffer.put(area=0, image=_img(1), settled=True)
+        self.buffer.put(area=0, image=_img(2), settled=True)
+        third = self.buffer.put(area=0, image=_img(3), settled=True)
+        frame, skipped = self.buffer.skip_to_latest(area=0, after_seq=first.seq)
+        self.assertEqual(frame.seq, third.seq)
+        self.assertTrue(np.array_equal(frame.image, _img(3)))
+        # Из-за перехода к third НЕ будут распознаны и, значит, не прозвучат:
+        # сам first (ради него и вызвали skip_to_latest) и second (кандидат
+        # между ними) — итого 2, та же семантика, что у
+        # workers.skip_stale_duplicates (см. её докстринг и тест ниже).
+        self.assertEqual(skipped, 2)
+
+    def test_skipped_frames_become_read_and_leave_buffer_on_purge(self):
+        first = self.buffer.put(area=0, image=_img(1), settled=True)
+        second = self.buffer.put(area=0, image=_img(2), settled=True)
+        self.buffer.skip_to_latest(area=0, after_seq=first.seq)
+        # Пропущенный (второй) снимок помечен прочитанным — purge() заберёт
+        # его так же, как обычно прочитанный снимок, через retention секунд.
+        self.assertTrue(second.is_read)
+        self.clock.advance(5.1)
+        self.buffer.purge()
+        self.assertEqual(len(self.buffer), 1)   # остался только «латест» (третий put не делали)
+
+    def test_does_not_affect_other_areas(self):
+        # Сценарий как в OcrWorker.run(): кадр area=0/seq=1 уже взят на
+        # распознавание через take_next() — именно ЕГО актуальность и
+        # проверяется дальше через skip_to_latest(after_seq=1).
+        self.buffer.put(area=0, image=_img(1), settled=True)
+        current = self.buffer.take_next()
+        self.assertEqual(current.seq, 1)
+
+        area1_frame = self.buffer.put(area=1, image=_img(2), settled=True)
+        self.buffer.put(area=0, image=_img(3), settled=True)
+
+        frame, skipped = self.buffer.skip_to_latest(area=0, after_seq=current.seq)
+        # Пропущен ровно 1 снимок — сам current (area=0/seq=1): из-за перехода
+        # к более свежему seq=3 он тоже не будет распознан и озвучен. Кадр
+        # ДРУГОЙ области (area=1/seq=2), оказавшийся между ними по времени,
+        # в этот счётчик не входит вовсе — это проверяется ниже отдельно.
+        self.assertEqual(skipped, 1)
+        self.assertEqual(frame.seq, 3)
+        # Снимок области 1 остаётся нетронутым и непрочитанным — отдаётся как обычно,
+        # следующим по очереди (он старше третьего снимка области 0).
+        self.assertFalse(area1_frame.is_read)
+        self.assertEqual(self.buffer.take_next().seq, area1_frame.seq)
+
+    def test_ignores_already_read_frames(self):
+        first = self.buffer.put(area=0, image=_img(1), settled=True)
+        self.buffer.take_next()   # читаем первый снимок обычным путём
+        frame, skipped = self.buffer.skip_to_latest(area=0, after_seq=first.seq)
+        self.assertIsNone(frame)   # второго снимка нет, а первый уже прочитан — не считается
+        self.assertEqual(skipped, 0)
+
+    def test_ignores_marker_frames_as_candidates(self):
+        first = self.buffer.put(area=0, image=_img(1), settled=True)
+        self.buffer.put(area=0, image=None)   # область опустела — это метка, не кандидат
+        frame, skipped = self.buffer.skip_to_latest(area=0, after_seq=first.seq)
+        self.assertIsNone(frame)
+        self.assertEqual(skipped, 0)
+
+    def test_ignores_frames_at_or_before_after_seq(self):
+        first = self.buffer.put(area=0, image=_img(1), settled=True)
+        second = self.buffer.put(area=0, image=_img(2), settled=True)
+        # Запрашиваем «новее second» — сам second (и всё, что было раньше) не кандидат.
+        frame, skipped = self.buffer.skip_to_latest(area=0, after_seq=second.seq)
+        self.assertIsNone(frame)
+        self.assertEqual(skipped, 0)
+        self.assertFalse(first.is_read)   # первый снимок при этом не тронут
+
+
 class PurgeTests(unittest.TestCase):
     """Прочитанные снимки удаляются через retention, непрочитанные устаревшие — через max_unread_age."""
 

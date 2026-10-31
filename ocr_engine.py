@@ -14,6 +14,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Callable, List, Optional
 
+import cv2
 import numpy as np
 
 import config
@@ -74,6 +75,36 @@ class BaseOcr(ABC):
 # EasyOCR
 # ---------------------------------------------------------------------------
 
+def downscale_for_easyocr(image: np.ndarray, factor: float) -> np.ndarray:
+    """
+    Уменьшает кадр, уже подготовленный capture.preprocess_for_ocr, в ``factor``
+    раз по каждой стороне — непосредственно перед передачей в EasyOCR. См.
+    config.EASYOCR_DOWNSCALE_FACTOR, где подробно объясняется, зачем это
+    нужно (детектор EasyOCR — свёрточная сеть, время её работы растёт
+    примерно пропорционально числу пикселей входа, а кадр после общего для
+    обоих движков UPSCALE_FACTOR=2 в capture.py крупнее, чем нужно именно
+    EasyOCR). Координаты распознанных фрагментов после этого будут в
+    масштабе УЖЕ уменьшенного кадра — это безопасно, так как
+    EasyOcrEngine.recognize использует их только для взаимной сортировки
+    слева направо и сверху вниз, а не возвращает наружу в абсолютном виде.
+
+    ``factor <= 1.0`` не делает ничего (та же экономия, что и раньше,
+    отключена) и возвращает ``image`` как есть, без копирования — так
+    стандартное, не изменённое поведение по-прежнему ничего не стоит.
+    """
+    if factor <= 1.0:
+        return image
+    height, width = image.shape[:2]
+    new_width = max(1, round(width / factor))
+    new_height = max(1, round(height / factor))
+    # INTER_AREA — рекомендуемая OpenCV интерполяция именно для УМЕНЬШЕНИЯ
+    # изображения (в отличие от увеличения в preprocess_for_ocr, где
+    # оправдан INTER_CUBIC): она усредняет область пикселей, а не только
+    # ближайшие точки, и поэтому меньше теряет тонкие штрихи букв при
+    # сжатии уже бинаризованного (чёрно-белого) изображения.
+    return cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+
+
 class EasyOcrEngine(BaseOcr):
     """Распознавание через EasyOCR. Принудительно на CPU (gpu=False)."""
 
@@ -115,6 +146,7 @@ class EasyOcrEngine(BaseOcr):
     def recognize(self, image: np.ndarray) -> str:
         if self._reader is None:
             raise OcrError("Движок EasyOCR не инициализирован.")
+        image = downscale_for_easyocr(image, config.EASYOCR_DOWNSCALE_FACTOR)
         try:
             # paragraph=False, чтобы получить уверенность по каждому фрагменту.
             results = self._reader.readtext(image, detail=1, paragraph=False)

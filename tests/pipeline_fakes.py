@@ -149,6 +149,7 @@ def run_pipeline(
     play_seconds: float = 0.15,
     expected: Optional[int] = None,
     no_speech_warning_seconds: Optional[float] = None,
+    skip_outdated_frames: bool = True,
 ):
     """
     Запускает настоящие потоки на подделках и возвращает (плеер, OCR, буфер, шина событий).
@@ -175,7 +176,7 @@ def run_pipeline(
     tts = FakeTts()
     player = FakePlayer(tts, play_seconds)
 
-    ocr_worker_kwargs = {}
+    ocr_worker_kwargs = {"skip_outdated_frames": skip_outdated_frames}
     if no_speech_warning_seconds is not None:
         ocr_worker_kwargs["no_speech_warning_seconds"] = no_speech_warning_seconds
 

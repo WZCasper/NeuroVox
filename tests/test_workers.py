@@ -742,5 +742,91 @@ class _NullBuffer:
         pass
 
 
+class SkipOutdatedFramesIntegrationTests(unittest.TestCase):
+    """
+    Сквозные тесты через настоящие потоки на подделках экрана/OCR/TTS —
+    воспроизводят ситуацию, из-за которой возникла правка skip_to_latest:
+    OCR на процессоре без видеокарты занимает секунды, а субтитры в
+    диалоге сменяются чаще. Без пропуска устаревших снимков озвучка
+    начинает читать историю диалога с нарастающим отставанием; с
+    пропуском — всегда нагоняет то, что на экране сейчас.
+
+    Сценарий общий для обоих тестов: одна область, четыре реплики реального
+    диалога подряд, каждая держится на экране 0.6 с — заметно короче, чем
+    «тратит» на распознавание один снимок (ocr_latency=1.0 с). За то время,
+    что идёт распознавание первой реплики, на экране уже успевают смениться
+    вторая и начинается третья.
+
+    Фразы намеренно разной длины строки (а не просто «Первая»/«Вторая»...):
+    FakeOcr распознаёт по пиксельной разнице подготовленной для OCR картинки
+    (capture.frames_are_similar с tolerance=1.5), а короткие русские фразы
+    похожей длины визуально почти неотличимы на тёмном фоне — с ними
+    AreaTracker принимал бы соседние реплики за одну и ту же картинку и
+    просто не порождал бы отдельных снимков для каждой, что проверяло бы
+    не эту правку, а особенность тестового рендера.
+    """
+
+    _PHRASES = [
+        "Куда ты пропал",
+        "Мы ждали тебя всю ночь напролёт",
+        "Тише",
+        "Они уже здесь, я слышу шаги за дверью",
+    ]
+
+    @staticmethod
+    def _timeline(area, t):
+        index = int(t // 0.6)
+        if index >= 4:
+            return None
+        return SkipOutdatedFramesIntegrationTests._PHRASES[index]
+
+    def test_without_skipping_speech_lags_behind_and_reads_stale_backlog(self):
+        # Старое поведение (до правки): skip_outdated_frames=False — каждый
+        # устоявшийся снимок области честно распознаётся по очереди, даже
+        # если к моменту, когда до него доходит очередь, на экране давно
+        # уже другая реплика. Все 4 реплики в итоге звучат по порядку —
+        # именно это и даёт нарастающее отставание в реальной игре.
+        player, ocr, buffer, bus = run_pipeline(
+            self._timeline, rois=[[0, 0, 100, 40]], texts=self._PHRASES,
+            duration=6.0, ocr_latency=1.0, area_pause=0.05, capture_fps=20.0,
+            play_seconds=0.05, skip_outdated_frames=False,
+        )
+        self.assertEqual(player.phrases, self._PHRASES)
+        self.assertEqual(ocr.calls, 4)
+
+    def test_with_skipping_speech_catches_up_to_latest_phrase(self):
+        # Новое поведение (с правкой): skip_outdated_frames=True — пока
+        # распознавался очередной снимок, для той же области успевал
+        # накопиться более свежий; skip_to_latest перескакивает сразу к
+        # нему, не тратя время на распознавание и озвучку того, что уже
+        # неактуально.
+        player, ocr, buffer, bus = run_pipeline(
+            self._timeline, rois=[[0, 0, 100, 40]], texts=self._PHRASES,
+            duration=6.0, ocr_latency=1.0, area_pause=0.05, capture_fps=20.0,
+            play_seconds=0.05, skip_outdated_frames=True,
+        )
+        # Реплик распознано и озвучено меньше, чем без пропуска: время не
+        # тратится на распознавание и озвучку устаревшего.
+        self.assertLess(ocr.calls, 4)
+        self.assertLess(len(player.phrases), len(self._PHRASES))
+        # Третья реплика ("Тише") была показана и тут же перекрыта
+        # четвёртой за то время, что шло распознавание второй, — её
+        # НЕ должны озвучивать: это и есть устранённая задержка.
+        self.assertNotIn("Тише", player.phrases)
+        # Зато последняя реплика диалога точно должна прозвучать — это и
+        # есть «нагнать текущий момент на экране», ради чего всё сделано.
+        self.assertIn(self._PHRASES[-1], player.phrases)
+        # Хотя бы одно событие "skipped" должно подтвердить, что пропуск
+        # реально сработал (а не просто совпало, что реплик стало меньше
+        # по какой-то другой причине), и с правильным ненулевым числом.
+        events = bus.poll(limit=500)
+        skip_events = [e.text for e in events if e.kind == "skipped"]
+        self.assertTrue(skip_events, "ожидалось хотя бы одно событие о пропуске устаревших снимков")
+        self.assertTrue(
+            any(": 0" not in text for text in skip_events),
+            f"ожидалось событие с ненулевым числом пропущенных снимков, получено: {skip_events}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
