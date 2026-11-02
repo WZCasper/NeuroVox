@@ -22,7 +22,7 @@ logger = logging.getLogger("neurovox.config")
 # ---------------------------------------------------------------------------
 
 APP_NAME = "NeuroVox"
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.6.3"
 
 
 def _base_dir() -> Path:
