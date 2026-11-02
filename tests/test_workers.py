@@ -828,5 +828,210 @@ class SkipOutdatedFramesIntegrationTests(unittest.TestCase):
         )
 
 
+class _SilentFakeTts:
+    """
+    Минимальная подделка SileroTts для StartStopRaceConditionTests — в
+    отличие от _FakeSileroTts (используется только для available_speakers),
+    умеет synthesize(), но отдаёт ПУСТЫЕ фрагменты: AudioPlayer.play() на
+    пустом массиве сразу возвращается (см. 'if samples.size == 0: return'
+    в workers.AudioPlayer.play), не трогая настоящее sounddevice — что и
+    нужно для этого теста, который проверяет синхронизацию потоков
+    старт/стоп, а не реальное воспроизведение звука.
+    """
+
+    model_name = "fake_model"
+    is_loaded = True
+
+    def synthesize(self, text, speaker, speed=1.0):
+        import numpy as np
+        return [np.zeros(0, dtype=np.float32)]
+
+    def available_speakers(self):
+        return ["baya"]
+
+
+class _BlockingPrepareEngine:
+    """
+    Оборачивает реальный NeuroVoxEngine, подменяя _prepare_tts/_prepare_ocr
+    на версии, которые ждут сигнала из теста перед тем, как продолжить —
+    это даёт тесту детерминированный (без угадывания таймингов через
+    time.sleep) контроль над тем самым окном, в котором реальная загрузка
+    моделей EasyOCR/Silero занимает несколько секунд: именно в этом окне
+    могла возникать гонка start/stop, см. StartStopRaceConditionTests ниже.
+    """
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.prepare_started = threading.Event()   # подготовка (внутри _starter) дошла до ожидания
+        self.release_prepare = threading.Event()    # тест разрешает подготовке продолжить
+        self.prepare_tts_calls = 0
+        self.prepare_ocr_calls = 0
+
+        # НЕ вызываем настоящие _prepare_tts/_prepare_ocr — им нужны реальные
+        # torch/easyocr (которых в окружении для тестов проекта нет, см.
+        # tests/test_ocr_engine.py), и дело этого теста не в том, ЧТО именно
+        # грузится, а в том, КАК синхронизируются start()/stop() вокруг этой
+        # загрузки. _ocr/_tts для реально запускаемых потоков (capture/ocr/
+        # tts worker) подставляются отдельно в _make_engine ниже.
+        def blocking_prepare_tts(settings):
+            self.prepare_tts_calls += 1
+            self.prepare_started.set()
+            self.release_prepare.wait(timeout=5.0)
+
+        def blocking_prepare_ocr(settings):
+            self.prepare_ocr_calls += 1
+
+        engine._prepare_tts = blocking_prepare_tts
+        engine._prepare_ocr = blocking_prepare_ocr
+
+
+class StartStopRaceConditionTests(unittest.TestCase):
+    """
+    NeuroVoxEngine.start() готовит модели (_prepare_tts/_prepare_ocr) в
+    отдельном потоке (self._starter), чтобы не блокировать окно — реальная
+    загрузка EasyOCR/Silero занимает несколько секунд. Если пользователь
+    нажимает «Остановить» ДО того, как эта подготовка завершилась, а затем
+    снова «Запустить» — не должно получиться ДВУХ параллельных наборов
+    потоков поверх друг друга: start()/_finish_stop() должны либо дождаться
+    первой подготовки, либо не допустить второй её копии, пока первая ещё
+    жива. См. подробный комментарий в _finish_stop (workers.py) — это
+    воспроизводит именно ту гонку, которую он устраняет.
+    """
+
+    def _make_engine(self):
+        shared = SharedSettings(config.Settings())
+        shared.update(rois=[[0, 0, 100, 40]])
+        engine = NeuroVoxEngine(
+            shared, EventBus(),
+            capture_factory=lambda: _FakeCapture([_blank_frame()] * 50),
+        )
+        # Реальный AudioPlayer.check_device() трогает настоящее звуковое
+        # устройство — не нужно для этого теста (он про потоки, не про звук).
+        engine._player.check_device = lambda: None
+        # _prepare_tts/_prepare_ocr подменены на заглушки (см.
+        # _BlockingPrepareEngine) и больше не загружают настоящие torch/
+        # easyocr — но реально запускаемым потокам (OcrWorker,
+        # TtsPlaybackWorker) всё равно нужен какой-то движок вместо None.
+        engine._ocr = _FakeOcr()
+        engine._tts = _SilentFakeTts()
+        return engine
+
+    def test_stop_during_model_loading_waits_before_releasing_running_flag(self):
+        engine = self._make_engine()
+        blocker = _BlockingPrepareEngine(engine)
+
+        engine.start()
+        self.assertTrue(
+            blocker.prepare_started.wait(timeout=2.0),
+            "_prepare_tts не была вызвана — подготовка не началась вовремя",
+        )
+        # Подготовка (внутри self._starter) сейчас «висит» на release_prepare —
+        # это и есть окно, в котором реальная загрузка модели ещё идёт.
+        self.assertTrue(engine.is_running)
+
+        # stop() сама по себе не блокирует (см. её докстринг: "Не блокирует
+        # GUI надолго") — она лишь выставляет stop_event и запускает ЕЩЁ ОДИН
+        # отдельный поток (_finish_stop), который и делает реальную работу
+        # (join на _starter/_threads, сброс self._running). Поэтому engine.stop()
+        # можно звать прямо здесь, без обёрточного потока — дожидаться нужно
+        # не её возврата, а именно is_running через поллинг ниже.
+        engine.stop()
+        # is_running должен оставаться True ещё некоторое время — пока
+        # _starter всё ещё ждёт на release_prepare: он не добрался даже до
+        # первой проверки self._stop_event, а значит _finish_stop (внутри
+        # которого и живёт join на _starter) не может его пройти быстрее.
+        time.sleep(0.2)
+        self.assertTrue(
+            engine.is_running,
+            "is_running сбросился в False ДО того, как подготовка модели завершилась — "
+            "это и есть гонка: start() сразу после этого считал бы себя свободным",
+        )
+
+        # Отпускаем подготовку — теперь _prepare_tts продолжит и увидит
+        # self._stop_event уже установленным (stop() выставляет его синхронно).
+        blocker.release_prepare.set()
+        deadline = time.monotonic() + 5.0
+        while engine.is_running and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertFalse(engine.is_running, "is_running не сбросился в False вовремя после release_prepare")
+
+        # Второй старт — ПОСЛЕ того, как первая подготовка действительно
+        # завершилась. Без правки это сработало бы и раньше (во время
+        # «висения» на release_prepare), что и создавало гонку.
+        engine.start()
+        deadline = time.monotonic() + 2.0
+        while blocker.prepare_tts_calls < 2 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(
+            blocker.prepare_tts_calls, 2,
+            "второй start() не привёл ко второму вызову _prepare_tts — что-то не запустилось",
+        )
+        engine.stop()
+
+    def test_no_parallel_threads_after_stop_start_sequence_during_loading(self):
+        # Содержательная проверка того же сценария, но доведённая до конца:
+        # после start -> stop (пока ПЕРВАЯ подготовка ЕЩЁ висит, не отпущена)
+        # -> start (ПОКА первая всё ещё висит) -> отпускаем ОБЕ подготовки —
+        # не должно получиться двух параллельно запущенных наборов потоков.
+        #
+        # Важно: release_prepare нельзя отпускать ДО второго start() — если
+        # отпустить раньше, первая подготовка (даже на баговом коде, без
+        # starter.join() в _finish_stop) успевает самостоятельно, естественным
+        # путём завершиться и сбросить is_running ДО второго start(), и тогда
+        # реального окна одновременности попросту не возникает — тест такое
+        # не поймает. Гонка проявляется только когда второй start() случается,
+        # пока первая подготовка ВСЁ ЕЩЁ заблокирована на release_prepare.
+        engine = self._make_engine()
+        blocker = _BlockingPrepareEngine(engine)
+
+        engine.start()
+        self.assertTrue(blocker.prepare_started.wait(timeout=2.0))
+        # Первая подготовка сейчас висит на release_prepare.wait() — ещё НЕ
+        # отпущена. Останавливаем (не ждём: stop() и так не блокирует).
+        engine.stop()
+
+        # Второй start() — ПОКА первая подготовка всё ещё заблокирована.
+        # На исправленном коде is_running ещё True (start() внутри сам
+        # проверит это и ничего не сделает). На баговом коде is_running уже
+        # False к этому моменту (сброшен мгновенно, не дожидаясь _starter),
+        # и этот start() запускает ВТОРОЙ, параллельный _starter поверх
+        # первого, который всё ещё жив и тоже скоро продолжит работу.
+        engine.start()
+
+        # Теперь отпускаем обе подготовки разом (release_prepare — общий
+        # Event, его видят и первый, и возможный второй _starter).
+        blocker.release_prepare.set()
+        time.sleep(0.5)   # даём обоим (если их реально два) успеть дойти до конца
+
+        thread_count = len(engine._threads)
+        # Ровно 0 или ровно 3 — оба исхода корректны и зависят от точного
+        # тайминга (на исправленном коде второй start() обычно отвергается
+        # защитой self._running, и реально работает только первый _starter,
+        # который сам видит self._stop_event уже установленным и не доходит
+        # до создания потоков вовсе — тогда их 0; лишь слегка иначе
+        # сложившийся тайминг мог бы и один раз успеть создать потоки, но
+        # никогда не второй параллельный раз поверх). Важно, чего быть не
+        # должно: self._threads из ДВУХ одновременно живых независимых
+        # наборов (видно было бы как 6 потоков, если считать active_count,
+        # или вообще как ошибка при попытке повторно запустить тот же
+        # CaptureWorker на том же FrameBuffer) — это и проверяется ниже.
+        self.assertIn(
+            thread_count, (0, 3),
+            f"ожидалось 0 (второй start() отвергнут) или 3 (ровно один набор потоков), "
+            f"получено {thread_count} — если 6, значит запустились ДВА набора потоков поверх друг друга",
+        )
+        # Явная проверка числа вызовов _prepare_tts: при двух НЕЗАВИСИМО
+        # работающих _starter (баг) оба доходят до _prepare_tts — это 2.
+        # На исправленном коде второй start() отвергается ДО _prepare_tts,
+        # либо (при другом тайминге) первый _starter уже видит stop_event
+        # и не доходит до повторного вызова — в обоих случаях здесь 1.
+        self.assertEqual(
+            blocker.prepare_tts_calls, 1,
+            f"_prepare_tts вызвана {blocker.prepare_tts_calls} раз(а) вместо 1 — "
+            "значит второй start() не был отвергнут и запустил свой параллельный _starter",
+        )
+        engine.stop()
+
+
 if __name__ == "__main__":
     unittest.main()

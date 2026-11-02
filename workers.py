@@ -1136,6 +1136,23 @@ class NeuroVoxEngine:
 
     def _finish_stop(self) -> None:
         self._stop_event.set()
+        # Сначала дожидаемся self._starter (поток _prepare_and_start, см.
+        # start() ниже) — он готовит модели (_prepare_tts/_prepare_ocr) ДО
+        # того, как заполняет self._threads и создаёт self._buffer; пока он
+        # ещё работает, self._threads пуст, и цикл ниже по нему ничего не
+        # ждёт. Без этого «Остановить» сразу после «Запустить» (ещё во время
+        # загрузки модели) завершалось мгновенно и сбрасывало self._running
+        # в False, пока _prepare_and_start продолжал работать в фоне — и
+        # следующее нажатие «Запустить» запускало ВТОРОЙ, парал­лельный набор
+        # потоков поверх ещё не завершившегося первого (видно в логе как
+        # задвоенные «EasyOCR готов», «Поток ... запущен» и задвоенные
+        # сообщения о пропуске устаревших снимков). _prepare_and_start сам не
+        # прерывается на полпути загрузки модели (та не поддерживает отмену),
+        # но join() здесь просто ждёт её естественного завершения — сама
+        # загрузка и так всего несколько секунд, а гонка полностью уходит.
+        starter = self._starter
+        if starter is not None and starter.is_alive() and starter is not threading.current_thread():
+            starter.join()
         for thread in self._threads:
             if thread.is_alive() and thread is not threading.current_thread():
                 thread.join(timeout=3.0)
