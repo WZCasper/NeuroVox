@@ -47,6 +47,50 @@ _ALLOWED = re.compile(r"[^А-Яа-яЁёA-Za-z0-9\s.,!?:;\-–—…'\"()+]")
 # передаём только те, которые модель действительно принимает.
 _OPTIONAL_TTS_KWARGS = ("put_accent", "put_yo", "put_stress_homo", "put_yo_homo")
 
+# Разбивка SSML-чанка по предложениям — та же логика, что и _SENTENCE_SPLIT выше,
+# но с сохранением самого разделителя (группа) и без выбрасывания разделителя,
+# чтобы не терять пробел между собранными предложениями при склейке через join.
+_SENTENCE_SPLIT_KEEP = re.compile(r"(?<=[.!?…])\s+")
+
+# Таблица экранирования для текста внутри SSML-тегов (XML). Обычный текст
+# субтитров уже отфильтрован через _ALLOWED в prepare_text и не должен
+# содержать эти символы, но словарь ударений пользователя — произвольный
+# текстовый файл, который он редактирует сам, так что подстраховываемся явно,
+# а не полагаемся только на фильтр выше по конвейеру.
+_XML_ESCAPE = (
+    ("&", "&amp;"),
+    ("<", "&lt;"),
+    (">", "&gt;"),
+    ('"', "&quot;"),
+)
+
+
+def _xml_escape(text: str) -> str:
+    for char, escaped in _XML_ESCAPE:
+        text = text.replace(char, escaped)
+    return text
+
+
+def build_ssml(chunk: str) -> str:
+    """
+    Оборачивает уже подготовленный текстовый чанк (после словаря ударений,
+    без запрещённых символов) в SSML-разметку Silero: каждое предложение —
+    в собственный тег <s>, весь чанк — в <speak>.
+
+    По официальной документации Silero (wiki/SSML, раздел "s"), тег <s>
+    эквивалентен паузе strength="strong" между соседними предложениями —
+    именно такая межфразовая пауза отсутствовала при обычном, не-SSML
+    вызове apply_tts(text=...), из-за чего несколько предложений подряд
+    звучали слитно, без пауз, "рубленой" скороговоркой. Если чанк состоит
+    из одного предложения, результат эквивалентен прежнему звучанию —
+    пауза появляется только МЕЖДУ несколькими <s>, не внутри одного.
+    """
+    sentences = [s.strip() for s in _SENTENCE_SPLIT_KEEP.split(chunk) if s.strip()]
+    if not sentences:
+        sentences = [chunk]
+    wrapped = "".join(f"<s>{_xml_escape(sentence)}</s>" for sentence in sentences)
+    return f"<speak>{wrapped}</speak>"
+
 # Python сообщает имя лишнего параметра в тексте ошибки: unexpected keyword argument 'имя'.
 _UNEXPECTED_KWARG = re.compile(r"unexpected keyword argument '(\w+)'")
 
@@ -342,6 +386,12 @@ class SileroTts:
         self._model = None
         self._torch = None
         self._optional_kwargs: tuple = _OPTIONAL_TTS_KWARGS
+        # Пробуем SSML (паузы между предложениями через <s>, см. build_ssml)
+        # до тех пор, пока конкретная загруженная модель сама не откажется
+        # принимать ssml_text — тогда откатываемся на обычный text один раз
+        # и дальше, для этой же модели, SSML больше не пробуем: по одному и
+        # тому же TypeError на каждый вызов незачем гонять заново.
+        self._ssml_supported: bool = True
         self._dictionary = StressDictionary()
         self._cache = _SynthesisCache(self.sample_rate)
         # Имя модели, для которой сейчас актуален кэш. Отдельно от model_name:
@@ -427,16 +477,42 @@ class SileroTts:
 
         Если модель не принимает какой-то параметр, отказываемся именно от него, а не
         от всех сразу: например, v4_ru не знает про омографы, но ударения ставит.
+
+        Текст передаётся как ssml_text (с паузами между предложениями через
+        build_ssml — см. её докстринг) всегда, кроме случаев, когда сама
+        загруженная модель явно отвергла ssml_text как неожиданный параметр:
+        тогда self._ssml_supported становится False, и дальше для этой модели
+        используется обычный text с тем же, но не размеченным текстом чанка.
         """
-        base = {"text": chunk, "speaker": speaker, "sample_rate": self.sample_rate}
+        if self._ssml_supported:
+            base = {"ssml_text": build_ssml(chunk), "speaker": speaker, "sample_rate": self.sample_rate}
+        else:
+            base = {"text": chunk, "speaker": speaker, "sample_rate": self.sample_rate}
         extra = {name: True for name in self._optional_kwargs}
         while True:
             try:
                 return self._model.apply_tts(**base, **extra)
             except TypeError as exc:
+                message = str(exc)
+                # Откат на обычный text пробуем первым, при ЛЮБОМ TypeError, —
+                # не только когда сообщение явно называет ssml_text: некоторые
+                # модели требуют text как обязательный позиционный параметр и
+                # дают неразборчивое сообщение вроде "missing 1 required
+                # positional argument: 'text'" или вовсе непарсируемый текст,
+                # если его не передать. Это восстанавливает ту же устойчивость
+                # к непредсказуемым сообщениям об ошибках, которую ветка ниже
+                # (extra-параметры) уже обеспечивает для put_accent и прочих.
+                if self._ssml_supported:
+                    logger.info(
+                        "Модель не принимает ssml_text (%s) — синтез выполняется без межфразовых пауз SSML.",
+                        message,
+                    )
+                    self._ssml_supported = False
+                    base = {"text": chunk, "speaker": speaker, "sample_rate": self.sample_rate}
+                    continue
                 if not extra:
                     raise
-                match = _UNEXPECTED_KWARG.search(str(exc))
+                match = _UNEXPECTED_KWARG.search(message)
                 rejected = match.group(1) if match else None
                 if rejected in extra:
                     del extra[rejected]
