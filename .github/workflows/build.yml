@@ -186,4 +186,25 @@ jobs:
           if (Test-Path "dist-installer\NeuroVox-Setup.exe") {
             $assets = @("dist-installer\NeuroVox-Setup.exe") + $assets
           }
-          gh release create $env:GITHUB_REF_NAME @assets --title "NeuroVox $env:GITHUB_REF_NAME" --notes-file .github\release-notes.md
+          # Релиз под этим тегом мог уже существовать — например, если его
+          # создали через форму "Draft a new release" на сайте GitHub (она
+          # создаёт тег и пустой релиз с автоматическими архивами исходников
+          # сразу, одним действием, раньше, чем эта сборка успевает дойти до
+          # этого шага). Раньше gh release create в такой ситуации падал с
+          # "a release with the same tag name already exists", и настоящие
+          # файлы программы (.exe, .zip) так и не попадали в релиз.
+          #
+          # Проверяем $LASTEXITCODE явно, а не "if (gh release view ...)":
+          # в PowerShell такое условие проверяет наличие вывода команды в
+          # success stream, а НЕ код её завершения — ненадёжный индикатор
+          # успеха внешней команды. *>$null подавляет вывод (в т.ч. саму
+          # non-terminating ошибку при отсутствии релиза — этот шаг не
+          # делает $ErrorActionPreference = 'Stop', так что выполнение
+          # продолжится к проверке $LASTEXITCODE ниже, а не прервётся).
+          gh release view $env:GITHUB_REF_NAME *>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Релиз $env:GITHUB_REF_NAME уже существует — дозагружаю файлы программы."
+            gh release upload $env:GITHUB_REF_NAME @assets --clobber
+          } else {
+            gh release create $env:GITHUB_REF_NAME @assets --title "NeuroVox $env:GITHUB_REF_NAME" --notes-file .github\release-notes.md
+          }
