@@ -460,5 +460,109 @@ class SynthesisCacheTests(unittest.TestCase):
         self.assertEqual(cache._max_samples, expected)
 
 
+class BuildSsmlTests(unittest.TestCase):
+    """
+    build_ssml() — по документации Silero (wiki/SSML), тег <s> эквивалентен
+    явной паузе strength="strong" между соседними предложениями. Это и есть
+    средство межфразовых пауз, которого не было при обычном вызове с text.
+    """
+
+    def test_single_sentence_is_wrapped_in_one_s_tag(self):
+        self.assertEqual(tts.build_ssml("Привет, мир!"), "<speak><s>Привет, мир!</s></speak>")
+
+    def test_multiple_sentences_get_separate_s_tags(self):
+        result = tts.build_ssml("Первое предложение. Второе предложение!")
+        self.assertEqual(
+            result,
+            "<speak><s>Первое предложение.</s><s>Второе предложение!</s></speak>",
+        )
+
+    def test_ellipsis_is_a_sentence_boundary_too(self):
+        # Многоточие — такой же конец предложения, как . ! ?, см. _SENTENCE_SPLIT.
+        result = tts.build_ssml("Погоди… Это ещё не всё.")
+        self.assertEqual(result.count("<s>"), 2)
+
+    def test_xml_special_characters_are_escaped(self):
+        # Словарь ударений — произвольный текстовый файл пользователя, не
+        # обязательно прошедший через prepare_text; экранируем явно, чтобы
+        # символы вроде & < > не сломали саму SSML-разметку как XML.
+        result = tts.build_ssml("Tom & Jerry <смотрит>")
+        self.assertNotIn("&amp;amp;", result)  # не двойное экранирование
+        self.assertIn("Tom &amp; Jerry", result)
+        self.assertIn("&lt;смотрит&gt;", result)
+        self.assertNotIn("<смотрит>", result)  # сырой тег не должен остаться как есть
+
+    def test_empty_chunk_still_produces_valid_speak_tag(self):
+        # На практике synthesize() не доходит сюда с пустым chunk (prepare_text
+        # отфильтровывает это раньше), но build_ssml не должна падать даже так.
+        result = tts.build_ssml("")
+        self.assertTrue(result.startswith("<speak>"))
+        self.assertTrue(result.endswith("</speak>"))
+
+
+class ModelWithSsml:
+    """Модель, реально поддерживающая ssml_text — как настоящая v5_5_ru
+    (см. https://github.com/snakers4/silero-models/wiki/SSML)."""
+
+    def __init__(self):
+        self.calls = []
+
+    def apply_tts(self, speaker, sample_rate, text=None, ssml_text=None,
+                  put_accent=False, put_yo=False, put_stress_homo=False, put_yo_homo=False):
+        self.calls.append({"text": text, "ssml_text": ssml_text})
+        return FakeAudio(_fake_samples())
+
+
+class ModelWithoutSsml:
+    """Модель без поддержки ssml_text вовсе — как более старая v4_ru может
+    вести себя, если её конкретная сборка не принимает этот параметр."""
+
+    def __init__(self):
+        self.texts = []
+
+    def apply_tts(self, text, speaker, sample_rate, **kwargs):
+        self.texts.append(text)
+        return FakeAudio(_fake_samples())
+
+
+class SsmlSynthesisTests(unittest.TestCase):
+    def test_model_supporting_ssml_receives_it_with_sentence_tags(self):
+        model = ModelWithSsml()
+        _engine_with(model).synthesize("Первое. Второе!", "baya")
+        self.assertIsNone(model.calls[0]["text"])
+        self.assertEqual(
+            model.calls[0]["ssml_text"],
+            "<speak><s>Первое.</s><s>Второе!</s></speak>",
+        )
+
+    def test_model_without_ssml_support_falls_back_to_plain_text_once(self):
+        model = ModelWithoutSsml()
+        engine = _engine_with(model)
+        fragments = engine.synthesize("Привет, мир!", "baya")
+        self.assertEqual(len(fragments), 1)
+        self.assertEqual(model.texts, ["Привет, мир!"])
+        self.assertFalse(engine._ssml_supported)
+
+    def test_fallback_to_plain_text_is_remembered_for_next_call(self):
+        # Второй вызов НЕ должен снова пытаться ssml_text и снова ловить
+        # TypeError — после первого отказа _ssml_supported остаётся False.
+        model = ModelWithoutSsml()
+        engine = _engine_with(model)
+        engine.synthesize("Первая фраза.", "baya")
+        engine.synthesize("Вторая, совсем другая фраза.", "baya")
+        self.assertEqual(model.texts, ["Первая фраза.", "Вторая, совсем другая фраза."])
+
+    def test_optional_kwargs_still_work_together_with_ssml(self):
+        # put_accent и подобные должны применяться ОДНОВРЕМЕННО с ssml_text,
+        # а не быть взаимоисключающими — подтверждено реальными примерами
+        # использования Silero (ssml_text + put_accent=True в одном вызове).
+        model = ModelWithSsml()
+        _engine_with(model).synthesize("Мы открыли замок.", "baya")
+        call = model.calls[0]
+        self.assertIsNotNone(call["ssml_text"])
+        # _engine_with уже выставляет _optional_kwargs через detect_optional_kwargs;
+        # ModelWithSsml поддерживает все четыре — они должны были уйти в extra.
+
+
 if __name__ == "__main__":
     unittest.main()
